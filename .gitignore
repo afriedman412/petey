@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.so
+.DS_Store
+venv/
+.env
+*.csv
+output/
+PAR_files/
+.python-version
+.vscode/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
