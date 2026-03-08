@@ -5,6 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py par_rag_extract.py ./
+COPY server/ server/
+COPY templates/ templates/
+COPY schemas/ schemas/
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "8080"]

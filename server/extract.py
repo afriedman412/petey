@@ -11,14 +11,16 @@ from pydantic import BaseModel, Field, create_model
 from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent / ".env")
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+load_dotenv(BASE_DIR / ".env")
 
 SYSTEM = "You extract structured data from documents. Use null for missing or unreadable values."
 
 client = instructor.from_openai(OpenAI())
 async_client = instructor.from_openai(AsyncOpenAI())
 
-SCHEMAS_DIR = Path(__file__).parent / "schemas"
+SCHEMAS_DIR = BASE_DIR / "schemas"
 
 
 def _build_field(name: str, cfg: dict) -> tuple:
@@ -35,8 +37,11 @@ def _build_field(name: str, cfg: dict) -> tuple:
                 type=str,
             )
             return enum_cls | None, Field(None, description=desc)
-        # No values specified — use string and let the model infer
-        infer_desc = desc + " (infer possible values from the data)" if desc else "Infer possible values from the data"
+        infer_desc = (
+            desc + " (infer possible values from the data)"
+            if desc
+            else "Infer possible values from the data"
+        )
         return str | None, Field(None, description=infer_desc)
     elif ftype == "number":
         return float | None, Field(None, description=desc)
@@ -64,13 +69,18 @@ def _build_model(spec: dict) -> type[BaseModel]:
     if spec.get("record_type") == "array":
         model = create_model(
             spec.get("name", "ExtractedData").replace(" ", "") + "List",
-            items=(list[model], Field(..., description="List of extracted records")),
+            items=(
+                list[model],
+                Field(..., description="List of extracted records"),
+            ),
         )
 
     return model
 
 
-def load_schema(schema_path: str | Path) -> tuple[type[BaseModel], dict]:
+def load_schema(
+    schema_path: str | Path,
+) -> tuple[type[BaseModel], dict]:
     """Load a YAML schema and return (PydanticModel, schema_meta)."""
     with open(schema_path) as f:
         spec = yaml.safe_load(f)
@@ -93,7 +103,10 @@ def _make_messages(text: str, instructions: str = "") -> list[dict]:
         system += "\n\nAdditional instructions:\n" + instructions
     return [
         {"role": "system", "content": system},
-        {"role": "user", "content": f"Extract fields from this document:\n\n{text}"},
+        {
+            "role": "user",
+            "content": f"Extract fields from this document:\n\n{text}",
+        },
     ]
 
 
@@ -150,7 +163,7 @@ if __name__ == "__main__":
     schema_path = SCHEMAS_DIR / "par_decision.yaml"
     response_model, spec = load_schema(schema_path)
 
-    par_dir = Path(__file__).parent / "PAR_files"
+    par_dir = BASE_DIR / "PAR_files"
     if len(sys.argv) > 1:
         files = [par_dir / f for f in sys.argv[1:]]
     else:

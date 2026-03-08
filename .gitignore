@@ -14,3 +14,4 @@ dist/
 build/
 .mypy_cache/
 .ruff_cache/
+MCI_test/
