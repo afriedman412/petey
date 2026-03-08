@@ -2,16 +2,16 @@ VENV = venv
 PYTHON = $(VENV)/bin/python
 PIP = $(VENV)/bin/pip
 
-.PHONY: venv install run clean
+.PHONY: venv install test clean
 
 venv:
 	python3 -m venv $(VENV)
-	$(PIP) install -r requirements.txt
 
 install: venv
+	$(PIP) install -e ".[dev]"
 
-run: venv
-	$(VENV)/bin/uvicorn server.app:app --reload
+test: install
+	$(PYTHON) -m pytest tests/ -v
 
 clean:
-	rm -rf $(VENV)
+	rm -rf $(VENV) *.egg-info
