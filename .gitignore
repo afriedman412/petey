@@ -16,3 +16,4 @@ build/
 .ruff_cache/
 MCI_test/
 settings.json
+.claude/settings.local.json
