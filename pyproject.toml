@@ -37,6 +37,8 @@ Repository = "https://github.com/user/petey"
 dev = [
     "pytest",
     "pytest-asyncio",
+    "build",
+    "twine",
 ]
 
 [tool.setuptools.packages.find]
