@@ -17,7 +17,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from petey.schema import load_schema
-from petey.extract import extract_batch
+from petey.extract import extract_batch, extract_pages_async
 
 
 def _collect_pdfs(paths: list[str]) -> list[str]:
@@ -82,6 +82,8 @@ def main():
     ext.add_argument("--format", "-f", choices=["csv", "json", "jsonl"], default=None,
                      help="Output format (inferred from -o extension if not set)")
     ext.add_argument("--instructions", "-i", default="", help="Additional extraction instructions")
+    ext.add_argument("--pages-per-chunk", "-p", type=int, default=None,
+                     help="Pages per chunk (default: 1 for table schemas, 0 to disable)")
 
     args = parser.parse_args()
 
@@ -108,7 +110,7 @@ def run_extract(args):
     fmt = args.format
     if not fmt and args.output:
         ext = Path(args.output).suffix.lower()
-        fmt = {"csv": "csv", ".json": "json", ".jsonl": "jsonl"}.get(ext, "jsonl")
+        fmt = {".csv": "csv", ".json": "json", ".jsonl": "jsonl"}.get(ext, "jsonl")
     if not fmt:
         fmt = "jsonl"
 
@@ -137,17 +139,70 @@ def run_extract(args):
             else:
                 print(line)
 
-    print(f"Petey: extracting {total} file{'s' if total > 1 else ''} with {model} (concurrency={args.concurrency})", file=sys.stderr)
+    instructions = args.instructions or spec.get("instructions", "")
 
-    results = asyncio.run(
-        extract_batch(
-            pdfs, response_model,
-            model=model,
-            instructions=args.instructions or spec.get("instructions", ""),
-            concurrency=args.concurrency,
-            on_result=on_result,
+    # Auto-chunk by page for array/table schemas unless explicitly disabled
+    pages_per_chunk = args.pages_per_chunk
+    if pages_per_chunk is None and is_array:
+        pages_per_chunk = 1
+
+    if pages_per_chunk:
+        # Page-chunked mode: split each PDF into chunks, extract concurrently
+        all_results = []
+        for pdf in pdfs:
+            from petey.extract import extract_text_pages
+            n_pages = len(extract_text_pages(pdf))
+            n_chunks = -(-n_pages // pages_per_chunk)  # ceil division
+            pdf_name = os.path.basename(pdf)
+            print(
+                f"Petey: splitting {pdf_name} into {n_chunks} chunk(s) "
+                f"({pages_per_chunk} page(s) each, {n_pages} pages total) "
+                f"with {model} (concurrency={args.concurrency})",
+                file=sys.stderr,
+            )
+            chunk_completed = 0
+
+            def on_chunk(label, data, _name=pdf_name):
+                nonlocal chunk_completed
+                chunk_completed += 1
+                if data.get("_error"):
+                    print(f"  [{chunk_completed}/{n_chunks}] ERROR {_name} {label}: {data['_error']}", file=sys.stderr)
+                else:
+                    print(f"  [{chunk_completed}/{n_chunks}] {_name} {label}", file=sys.stderr)
+                data["_source_file"] = _name
+                if fmt == "jsonl":
+                    line = json.dumps(data)
+                    if out_file:
+                        out_file.write(line + "\n")
+                        out_file.flush()
+                    else:
+                        print(line)
+
+            results = asyncio.run(
+                extract_pages_async(
+                    pdf, response_model,
+                    model=model,
+                    instructions=instructions,
+                    pages_per_chunk=pages_per_chunk,
+                    concurrency=args.concurrency,
+                    on_result=on_chunk,
+                )
+            )
+            all_results.extend(results)
+        results = all_results
+    else:
+        # Standard multi-file mode
+        print(f"Petey: extracting {total} file{'s' if total > 1 else ''} with {model} (concurrency={args.concurrency})", file=sys.stderr)
+
+        results = asyncio.run(
+            extract_batch(
+                pdfs, response_model,
+                model=model,
+                instructions=instructions,
+                concurrency=args.concurrency,
+                on_result=on_result,
+            )
         )
-    )
 
     if out_file:
         out_file.close()
@@ -158,6 +213,8 @@ def run_extract(args):
         if is_array and "items" in data:
             for item in data["items"]:
                 item["_source_file"] = data.get("_source_file", "")
+                if "_page" in data:
+                    item["_page"] = data["_page"]
                 all_records.append(item)
         elif not data.get("_error"):
             all_records.append(data)
@@ -184,7 +241,7 @@ def run_extract(args):
     elif fmt == "jsonl" and not args.output:
         pass  # Already streamed in on_result
 
-    print(f"Done. {len(all_records)} records from {total} files.", file=sys.stderr)
+    print(f"Done. {len(all_records)} records from {total} file{'s' if total > 1 else ''}.", file=sys.stderr)
 
 
 if __name__ == "__main__":

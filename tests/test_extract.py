@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from petey import extract_text, build_model, load_schema
+from petey import extract_text, extract_text_pages, build_model, load_schema
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MCI_PDF = FIXTURES / "mci_page1.pdf"
@@ -40,6 +40,14 @@ class TestExtractText:
         text = extract_text(str(MCI_PDF))
         assert "TOTAL CASES:" in text
         assert "5" in text
+
+    def test_extract_text_pages(self):
+        pages = extract_text_pages(str(MCI_PDF))
+        assert isinstance(pages, list)
+        assert len(pages) >= 1
+        # Full text should equal pages joined
+        full = extract_text(str(MCI_PDF))
+        assert full == "\n\n".join(pages)
 
 
 # ---------------------------------------------------------------------------

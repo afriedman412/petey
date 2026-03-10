@@ -21,6 +21,12 @@ def extract_text(pdf_path: str) -> str:
     return "\n\n".join(page.get_text("text") for page in doc)
 
 
+def extract_text_pages(pdf_path: str) -> list[str]:
+    """Extract text from each page of a PDF separately."""
+    doc = fitz.open(pdf_path)
+    return [page.get_text("text") for page in doc]
+
+
 def _get_provider(model: str) -> str:
     return "anthropic" if model.startswith("claude") else "openai"
 
@@ -81,6 +87,63 @@ def extract(
             model=model, api_key=api_key, instructions=instructions,
         )
     )
+
+
+async def extract_pages_async(
+    pdf_path: str,
+    response_model: type[BaseModel],
+    *,
+    model: str = "gpt-4.1-mini",
+    api_key: str | None = None,
+    instructions: str = "",
+    pages_per_chunk: int = 1,
+    concurrency: int = 10,
+    on_result=None,
+) -> list[dict]:
+    """
+    Split a PDF into page chunks and extract each concurrently.
+
+    Args:
+        pages_per_chunk: Number of pages per chunk (default 1).
+        concurrency: Max concurrent API calls.
+        on_result: Optional callback(chunk_label, data_dict) called as each chunk completes.
+
+    Returns list of result dicts (with _page and optionally _error).
+    """
+    pages = extract_text_pages(pdf_path)
+    chunks = []
+    for i in range(0, len(pages), pages_per_chunk):
+        chunk_pages = pages[i : i + pages_per_chunk]
+        text = "\n\n".join(chunk_pages)
+        start = i + 1
+        end = min(i + pages_per_chunk, len(pages))
+        label = f"p{start}" if start == end else f"p{start}-{end}"
+        chunks.append((label, text))
+
+    sem = asyncio.Semaphore(concurrency)
+    client = _make_client(model, api_key)
+    results = [None] * len(chunks)
+
+    async def _process(idx: int, label: str, text: str):
+        async with sem:
+            try:
+                result = await client.chat.completions.create(
+                    model=model,
+                    response_model=response_model,
+                    max_retries=2,
+                    messages=_make_messages(text, instructions),
+                    temperature=0,
+                )
+                data = result.model_dump()
+                data["_page"] = label
+            except Exception as e:
+                data = {"_page": label, "_error": str(e)}
+            results[idx] = data
+            if on_result:
+                on_result(label, data)
+
+    await asyncio.gather(*[_process(i, label, text) for i, (label, text) in enumerate(chunks)])
+    return results
 
 
 async def extract_batch(
