@@ -254,12 +254,58 @@ class TestSchemaEdgeCases:
             "fields": {"x": {"type": "string", "description": "X"}},
         }
         model = build_model(spec)
-        assert model.__name__ == "MyModel"
+        assert model.__name__ == "My_Model"
 
     def test_default_model_name(self):
         spec = {"fields": {"x": {"type": "string", "description": "X"}}}
         model = build_model(spec)
         assert model.__name__ == "ExtractedData"
+
+    def test_model_name_valid_for_openai(self):
+        """Model name must match OpenAI's function name pattern: ^[a-zA-Z0-9_-]+$"""
+        import re
+        pattern = re.compile(r"^[a-zA-Z0-9_-]+$")
+        cases = [
+            {"name": "cg_officers.yaml", "fields": {"x": {"type": "string", "description": ""}}},
+            {"name": "my schema", "fields": {"x": {"type": "string", "description": ""}}},
+            {"name": "test@v2", "fields": {"x": {"type": "string", "description": ""}}},
+            {"name": "simple_name", "fields": {"x": {"type": "string", "description": ""}}},
+        ]
+        for spec in cases:
+            model = build_model(spec)
+            assert pattern.match(model.__name__), (
+                f"Model name {model.__name__!r} from spec name {spec['name']!r} "
+                f"is not a valid OpenAI function name"
+            )
+
+    def test_array_model_name_valid_for_openai(self):
+        """Array wrapper model name must also be valid."""
+        import re
+        pattern = re.compile(r"^[a-zA-Z0-9_-]+$")
+        spec = {
+            "name": "cg_officers.yaml",
+            "record_type": "array",
+            "fields": {"x": {"type": "string", "description": ""}},
+        }
+        model = build_model(spec)
+        assert pattern.match(model.__name__), (
+            f"Array model name {model.__name__!r} is not a valid OpenAI function name"
+        )
+
+    def test_field_names_with_spaces(self):
+        """Field names with spaces should build without error."""
+        spec = {
+            "name": "cg_officers",
+            "record_type": "array",
+            "fields": {
+                "Signal Number": {"type": "number", "description": ""},
+                "Date of Rank": {"type": "date", "description": ""},
+                "Status Indicator Category": {"type": "string", "description": ""},
+            },
+        }
+        model = build_model(spec)
+        schema = model.model_json_schema()
+        assert "items" in schema.get("required", [])
 
     def test_text_warn_threshold_exists(self):
         from petey.extract import TEXT_WARN_THRESHOLD

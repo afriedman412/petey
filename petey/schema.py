@@ -2,10 +2,16 @@
 Schema loading and Pydantic model building.
 """
 import enum
+import re
 
 import yaml
 from pathlib import Path
 from pydantic import BaseModel, Field, create_model
+
+
+def _safe_name(name: str) -> str:
+    """Sanitize to match OpenAI's function name pattern: ^[a-zA-Z0-9_-]+$"""
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
 
 
 def _build_field(name: str, cfg: dict) -> tuple:
@@ -16,7 +22,7 @@ def _build_field(name: str, cfg: dict) -> tuple:
         values = cfg.get("values", [])
         if values:
             enum_cls = enum.Enum(
-                name + "_enum",
+                _safe_name(name) + "_enum",
                 {v.replace(" ", "_").lower(): v for v in values},
                 type=str,
             )
@@ -33,7 +39,7 @@ def _build_field(name: str, cfg: dict) -> tuple:
         sub_fields = {}
         for sub_name, sub_cfg in cfg.get("fields", {}).items():
             sub_fields[sub_name] = _build_field(sub_name, sub_cfg)
-        sub_model = create_model(name + "_item", **sub_fields)
+        sub_model = create_model(_safe_name(name) + "_item", **sub_fields)
         return list[sub_model] | None, Field(None, description=desc)
     else:  # string, date
         return str | None, Field(None, description=desc)
@@ -45,14 +51,15 @@ def build_model(spec: dict) -> type[BaseModel]:
     for name, cfg in spec["fields"].items():
         field_definitions[name] = _build_field(name, cfg)
 
+    model_name = _safe_name(spec.get("name", "ExtractedData"))
     model = create_model(
-        spec.get("name", "ExtractedData").replace(" ", ""),
+        model_name,
         **field_definitions,
     )
 
     if spec.get("record_type") == "array":
         model = create_model(
-            spec.get("name", "ExtractedData").replace(" ", "") + "List",
+            model_name + "List",
             items=(
                 list[model],
                 Field(..., description="List of extracted records"),

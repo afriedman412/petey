@@ -1,6 +1,0 @@
-name: MCI Closed Cases
-record_type: array
-fields:
-  BLDG ADDRESS:
-    type: string
-    description: The address of the building
