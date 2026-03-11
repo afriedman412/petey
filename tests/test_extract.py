@@ -3,10 +3,12 @@ Tests for the petey package.
 Tests text extraction and schema building using MCI page 1 as test data.
 """
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from petey import extract_text, extract_text_pages, build_model, load_schema
+from petey.extract import OCR_THRESHOLD
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MCI_PDF = FIXTURES / "mci_page1.pdf"
@@ -318,3 +320,161 @@ class TestSchemaEdgeCases:
     def test_text_warn_threshold_exists(self):
         from petey.extract import TEXT_WARN_THRESHOLD
         assert TEXT_WARN_THRESHOLD == 50_000
+
+
+# ---------------------------------------------------------------------------
+# Parser backends
+# ---------------------------------------------------------------------------
+
+class TestParsers:
+    # --- pymupdf (default) ---
+
+    def test_pymupdf_explicit(self):
+        text = extract_text(str(MCI_PDF), parser="pymupdf")
+        assert "WESTCHESTER COUNTY" in text
+
+    def test_pymupdf_pages_explicit(self):
+        pages = extract_text_pages(str(MCI_PDF), parser="pymupdf")
+        assert isinstance(pages, list)
+        assert len(pages) >= 1
+        assert any("WESTCHESTER COUNTY" in p for p in pages)
+
+    # --- marker (mocked) ---
+
+    def test_marker_calls_converter(self):
+        fake_rendered = MagicMock()
+        fake_rendered.markdown = "marker output text"
+        fake_converter = MagicMock(return_value=fake_rendered)
+        fake_converter_cls = MagicMock(return_value=fake_converter)
+
+        with patch.dict("sys.modules", {
+            "marker": MagicMock(),
+            "marker.converters": MagicMock(),
+            "marker.converters.pdf": MagicMock(PdfConverter=fake_converter_cls),
+            "marker.models": MagicMock(create_model_dict=MagicMock(return_value={})),
+        }):
+            text = extract_text(str(MCI_PDF), parser="marker")
+        assert text == "marker output text"
+
+    def test_marker_pages_returns_single_element(self):
+        fake_rendered = MagicMock()
+        fake_rendered.markdown = "marker full doc"
+        fake_converter = MagicMock(return_value=fake_rendered)
+        fake_converter_cls = MagicMock(return_value=fake_converter)
+
+        with patch.dict("sys.modules", {
+            "marker": MagicMock(),
+            "marker.converters": MagicMock(),
+            "marker.converters.pdf": MagicMock(PdfConverter=fake_converter_cls),
+            "marker.models": MagicMock(create_model_dict=MagicMock(return_value={})),
+        }):
+            pages = extract_text_pages(str(MCI_PDF), parser="marker")
+        assert pages == ["marker full doc"]
+
+    def test_marker_import_error(self):
+        with patch.dict("sys.modules", {"marker": None,
+                                        "marker.converters": None,
+                                        "marker.converters.pdf": None}):
+            with pytest.raises(ImportError, match="marker-pdf"):
+                extract_text(str(MCI_PDF), parser="marker")
+
+    # --- aryn (mocked) ---
+
+    def test_aryn_calls_partition(self):
+        fake_result = {
+            "elements": [
+                {"text_representation": "aryn block one"},
+                {"text_representation": "aryn block two"},
+                {"text_representation": ""},  # empty — should be filtered
+            ]
+        }
+        fake_partition = MagicMock(return_value=fake_result)
+
+        with patch.dict("sys.modules", {
+            "aryn_sdk": MagicMock(),
+            "aryn_sdk.partition": MagicMock(partition_file=fake_partition),
+        }):
+            text = extract_text(str(MCI_PDF), parser="aryn")
+        assert "aryn block one" in text
+        assert "aryn block two" in text
+        # Empty text_representation filtered out
+        assert text.count("\n\n") == 1
+
+    def test_aryn_pages_returns_single_element(self):
+        fake_result = {"elements": [{"text_representation": "aryn text"}]}
+        fake_partition = MagicMock(return_value=fake_result)
+
+        with patch.dict("sys.modules", {
+            "aryn_sdk": MagicMock(),
+            "aryn_sdk.partition": MagicMock(partition_file=fake_partition),
+        }):
+            pages = extract_text_pages(str(MCI_PDF), parser="aryn")
+        assert pages == ["aryn text"]
+
+    def test_aryn_uses_env_api_key(self, monkeypatch):
+        monkeypatch.setenv("ARYN_API_KEY", "test-key-123")
+        fake_result = {"elements": [{"text_representation": "text"}]}
+        fake_partition = MagicMock(return_value=fake_result)
+
+        with patch.dict("sys.modules", {
+            "aryn_sdk": MagicMock(),
+            "aryn_sdk.partition": MagicMock(partition_file=fake_partition),
+        }):
+            extract_text(str(MCI_PDF), parser="aryn")
+        _, kwargs = fake_partition.call_args
+        assert kwargs.get("aryn_api_key") == "test-key-123"
+
+    def test_aryn_import_error(self):
+        with patch.dict("sys.modules", {"aryn_sdk": None,
+                                        "aryn_sdk.partition": None}):
+            with pytest.raises(ImportError, match="aryn-sdk"):
+                extract_text(str(MCI_PDF), parser="aryn")
+
+    # --- OCR fallback ---
+
+    def test_ocr_threshold_constant(self):
+        assert OCR_THRESHOLD == 100
+
+    def test_ocr_not_triggered_when_text_present(self):
+        # MCI PDF has plenty of text — OCR should never be called
+        with patch("petey.extract._ocr_pymupdf") as mock_ocr:
+            text = extract_text(str(MCI_PDF), parser="pymupdf", ocr_fallback=True)
+        mock_ocr.assert_not_called()
+        assert "WESTCHESTER COUNTY" in text
+
+    def test_ocr_triggered_when_no_text(self, tmp_path):
+        # Create a PDF with no text layer
+        import fitz
+        doc = fitz.open()
+        doc.new_page()
+        blank_pdf = tmp_path / "blank.pdf"
+        doc.save(str(blank_pdf))
+
+        with patch("petey.extract._ocr_pymupdf", return_value="ocr result") as mock_ocr:
+            text = extract_text(str(blank_pdf), parser="pymupdf", ocr_fallback=True)
+        mock_ocr.assert_called_once()
+        assert text == "ocr result"
+
+    def test_ocr_not_triggered_when_fallback_disabled(self, tmp_path):
+        import fitz
+        doc = fitz.open()
+        doc.new_page()
+        blank_pdf = tmp_path / "blank.pdf"
+        doc.save(str(blank_pdf))
+
+        with patch("petey.extract._ocr_pymupdf") as mock_ocr:
+            extract_text(str(blank_pdf), parser="pymupdf", ocr_fallback=False)
+        mock_ocr.assert_not_called()
+
+    def test_ocr_import_error(self, tmp_path):
+        import fitz
+        doc = fitz.open()
+        doc.new_page()
+        blank_pdf = tmp_path / "blank.pdf"
+        doc.save(str(blank_pdf))
+
+        with patch.dict("sys.modules", {"pytesseract": None, "PIL": None}):
+            with pytest.raises(ImportError, match="petey\\[ocr\\]"):
+                extract_text(
+                    str(blank_pdf), parser="pymupdf", ocr_fallback=True
+                )

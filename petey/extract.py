@@ -11,21 +11,126 @@ from pydantic import BaseModel
 from openai import AsyncOpenAI
 from anthropic import AsyncAnthropic
 
-SYSTEM = "You extract structured data from documents. Use null for missing or unreadable values."
+SYSTEM = (
+    "You extract structured data from documents. "
+    "Use null for missing or unreadable values."
+)
 
 TEXT_WARN_THRESHOLD = 50_000
 
 
-def extract_text(pdf_path: str) -> str:
+# --- PDF text extraction backends ---
+
+OCR_THRESHOLD = 100  # chars below which pymupdf output is treated as empty
+
+
+def extract_text(
+    pdf_path: str,
+    parser: str = "pymupdf",
+    ocr_fallback: bool = False,
+) -> str:
+    if parser == "marker":
+        return _extract_text_marker(pdf_path)
+    elif parser == "aryn":
+        return _extract_text_aryn(pdf_path)
     doc = fitz.open(pdf_path)
-    return "\n\n".join(page.get_text("text") for page in doc)
+    text = "\n\n".join(page.get_text("text") for page in doc)
+    if ocr_fallback and len(text.strip()) < OCR_THRESHOLD:
+        return _ocr_pymupdf(doc)
+    return text
 
 
-def extract_text_pages(pdf_path: str) -> list[str]:
+def extract_text_pages(
+    pdf_path: str,
+    parser: str = "pymupdf",
+    ocr_fallback: bool = False,
+) -> list[str]:
     """Extract text from each page of a PDF separately."""
+    if parser == "marker":
+        # marker doesn't have a clean per-page API; return full text as single page
+        return [_extract_text_marker(pdf_path)]
+    elif parser == "aryn":
+        return [_extract_text_aryn(pdf_path)]
     doc = fitz.open(pdf_path)
-    return [page.get_text("text") for page in doc]
+    pages = []
+    for page in doc:
+        text = page.get_text("text")
+        if ocr_fallback and len(text.strip()) < OCR_THRESHOLD:
+            text = _ocr_page(page)
+        pages.append(text)
+    return pages
 
+
+def _ocr_pymupdf(doc) -> str:
+    """OCR all pages of an open fitz document using pytesseract."""
+    return "\n\n".join(_ocr_page(page) for page in doc)
+
+
+def _ocr_page(page) -> str:
+    """OCR a single fitz page using pytesseract."""
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+    except ImportError:
+        raise ImportError(
+            "pytesseract and Pillow are required for OCR fallback. "
+            "Install them with: pip install petey[ocr]"
+        )
+    pix = page.get_pixmap(dpi=200)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    return pytesseract.image_to_string(img)
+
+
+def _extract_text_marker(pdf_path: str) -> str:
+    try:
+        from marker.converters.pdf import PdfConverter
+        from marker.models import create_model_dict
+    except ImportError:
+        raise ImportError(
+            "marker is required for parser='marker'. "
+            "Install it with: pip install marker-pdf"
+        )
+    converter = PdfConverter(artifact_dict=create_model_dict())
+    rendered = converter(pdf_path)
+    return rendered.markdown
+
+
+def _extract_text_aryn(pdf_path: str, api_key: str | None = None) -> str:
+    try:
+        from aryn_sdk.partition import partition_file
+    except ImportError:
+        raise ImportError(
+            "aryn-sdk is required for parser='aryn'. "
+            "Install it with: pip install aryn-sdk"
+        )
+    key = api_key or os.environ.get("ARYN_API_KEY")
+    with open(pdf_path, "rb") as f:
+        result = partition_file(f, aryn_api_key=key)
+    texts = [
+        el.get("text_representation", "")
+        for el in result.get("elements", [])
+        if el.get("text_representation")
+    ]
+    return "\n\n".join(texts)
+
+
+async def _extract_text_async(
+    pdf_path: str,
+    parser: str = "pymupdf",
+    aryn_api_key: str | None = None,
+    ocr_fallback: bool = False,
+) -> str:
+    """Async text extraction — runs Aryn in a thread to avoid blocking the event loop."""
+    if parser == "aryn":
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, lambda: _extract_text_aryn(pdf_path, aryn_api_key)
+        )
+    return extract_text(pdf_path, parser, ocr_fallback=ocr_fallback)
+
+
+# --- LLM client ---
 
 def _get_provider(model: str) -> str:
     return "anthropic" if model.startswith("claude") else "openai"
@@ -48,9 +153,11 @@ def _make_messages(text: str, instructions: str = "") -> list[dict]:
         system += "\n\nAdditional instructions:\n" + instructions
     return [
         {"role": "system", "content": system},
-        {"role": "user", "content": f"Extract fields from this document:\n\n{text}"},
+        {"role": "user", "content": f"Extract fields from this document:\n\n{text}"},  # noqa: E501
     ]
 
+
+# --- Single-file extraction ---
 
 async def extract_async(
     pdf_path: str,
@@ -59,9 +166,14 @@ async def extract_async(
     model: str = "gpt-4.1-mini",
     api_key: str | None = None,
     instructions: str = "",
+    parser: str = "pymupdf",
+    aryn_api_key: str | None = None,
+    ocr_fallback: bool = False,
 ) -> BaseModel:
     """Extract structured data from a PDF."""
-    text = extract_text(pdf_path)
+    text = await _extract_text_async(
+        pdf_path, parser, aryn_api_key, ocr_fallback=ocr_fallback
+    )
     client = _make_client(model, api_key)
     return await client.chat.completions.create(
         model=model,
@@ -79,15 +191,22 @@ def extract(
     model: str = "gpt-4.1-mini",
     api_key: str | None = None,
     instructions: str = "",
+    parser: str = "pymupdf",
+    aryn_api_key: str | None = None,
+    ocr_fallback: bool = False,
 ) -> BaseModel:
     """Sync wrapper around extract_async."""
     return asyncio.run(
         extract_async(
             pdf_path, response_model,
             model=model, api_key=api_key, instructions=instructions,
+            parser=parser, aryn_api_key=aryn_api_key,
+            ocr_fallback=ocr_fallback,
         )
     )
 
+
+# --- Page-chunked extraction ---
 
 async def extract_pages_async(
     pdf_path: str,
@@ -99,6 +218,8 @@ async def extract_pages_async(
     pages_per_chunk: int = 1,
     concurrency: int = 10,
     on_result=None,
+    parser: str = "pymupdf",
+    aryn_api_key: str | None = None,
 ) -> list[dict]:
     """
     Split a PDF into page chunks and extract each concurrently.
@@ -106,11 +227,12 @@ async def extract_pages_async(
     Args:
         pages_per_chunk: Number of pages per chunk (default 1).
         concurrency: Max concurrent API calls.
-        on_result: Optional callback(chunk_label, data_dict) called as each chunk completes.
+        on_result: Optional callback(chunk_label, data_dict) called as each
+            chunk completes.
 
     Returns list of result dicts (with _page and optionally _error).
     """
-    pages = extract_text_pages(pdf_path)
+    pages = extract_text_pages(pdf_path, parser)
     chunks = []
     for i in range(0, len(pages), pages_per_chunk):
         chunk_pages = pages[i : i + pages_per_chunk]
@@ -142,9 +264,13 @@ async def extract_pages_async(
             if on_result:
                 on_result(label, data)
 
-    await asyncio.gather(*[_process(i, label, text) for i, (label, text) in enumerate(chunks)])
+    await asyncio.gather(
+        *[_process(i, label, text) for i, (label, text) in enumerate(chunks)]
+    )
     return results
 
+
+# --- Batch extraction ---
 
 async def extract_batch(
     pdf_paths: list[str],
@@ -155,6 +281,9 @@ async def extract_batch(
     instructions: str = "",
     concurrency: int = 10,
     on_result=None,
+    parser: str = "pymupdf",
+    aryn_api_key: str | None = None,
+    ocr_fallback: bool = False,
 ) -> list[dict]:
     """
     Extract from multiple PDFs concurrently.
@@ -162,6 +291,9 @@ async def extract_batch(
     Args:
         on_result: Optional callback(path, data_dict) called as each file completes.
         concurrency: Max concurrent API calls.
+        parser: PDF text extraction backend ('pymupdf', 'marker', or 'aryn').
+        aryn_api_key: Aryn API key (or set ARYN_API_KEY env var).
+        ocr_fallback: Fall back to pytesseract if pymupdf finds no text layer.
 
     Returns list of result dicts (with _source_file and optionally _error).
     """
@@ -172,7 +304,9 @@ async def extract_batch(
     async def _process(path: str):
         async with sem:
             try:
-                text = extract_text(path)
+                text = await _extract_text_async(
+                    path, parser, aryn_api_key, ocr_fallback=ocr_fallback
+                )
                 result = await client.chat.completions.create(
                     model=model,
                     response_model=response_model,
@@ -183,7 +317,10 @@ async def extract_batch(
                 data = result.model_dump()
                 data["_source_file"] = os.path.basename(path)
             except Exception as e:
-                data = {"_source_file": os.path.basename(path), "_error": str(e)}
+                data = {
+                    "_source_file": os.path.basename(path),
+                    "_error": str(e),
+                }
             results.append(data)
             if on_result:
                 on_result(path, data)

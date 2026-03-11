@@ -76,14 +76,39 @@ def main():
     ext = sub.add_parser("extract", help="Extract data from PDFs")
     ext.add_argument("paths", nargs="+", help="PDF files or directories")
     ext.add_argument("--schema", "-s", required=True, help="YAML schema file")
-    ext.add_argument("--model", "-m", default=None, help="Model ID (default: gpt-4.1-mini)")
-    ext.add_argument("--concurrency", "-c", type=int, default=10, help="Concurrent requests (default: 10)")
-    ext.add_argument("--output", "-o", default=None, help="Output file (.csv, .json, or .jsonl)")
-    ext.add_argument("--format", "-f", choices=["csv", "json", "jsonl"], default=None,
-                     help="Output format (inferred from -o extension if not set)")
-    ext.add_argument("--instructions", "-i", default="", help="Additional extraction instructions")
-    ext.add_argument("--pages-per-chunk", "-p", type=int, default=None,
-                     help="Pages per chunk (default: 1 for table schemas, 0 to disable)")
+    ext.add_argument(
+        "--model", "-m", default=None,
+        help="Model ID (default: gpt-4.1-mini)",
+    )
+    ext.add_argument(
+        "--concurrency", "-c", type=int, default=10,
+        help="Concurrent requests (default: 10)",
+    )
+    ext.add_argument(
+        "--output", "-o", default=None,
+        help="Output file (.csv, .json, or .jsonl)",
+    )
+    ext.add_argument(
+        "--format", "-f", choices=["csv", "json", "jsonl"], default=None,
+        help="Output format (inferred from -o extension if not set)",
+    )
+    ext.add_argument(
+        "--instructions", "-i", default="",
+        help="Additional extraction instructions",
+    )
+    ext.add_argument(
+        "--pages-per-chunk", "-p", type=int, default=None,
+        help="Pages per chunk (default: 1 for table schemas, 0 to disable)",
+    )
+    ext.add_argument(
+        "--parser", default="pymupdf",
+        choices=["pymupdf", "marker", "aryn"],
+        help="PDF parser backend (default: pymupdf)",
+    )
+    ext.add_argument(
+        "--ocr-fallback", action="store_true",
+        help="Fall back to pytesseract OCR if pymupdf finds no text",
+    )
 
     args = parser.parse_args()
 
@@ -110,7 +135,9 @@ def run_extract(args):
     fmt = args.format
     if not fmt and args.output:
         ext = Path(args.output).suffix.lower()
-        fmt = {".csv": "csv", ".json": "json", ".jsonl": "jsonl"}.get(ext, "jsonl")
+        fmt = {".csv": "csv", ".json": "json", ".jsonl": "jsonl"}.get(
+            ext, "jsonl"
+        )
     if not fmt:
         fmt = "jsonl"
 
@@ -127,7 +154,10 @@ def run_extract(args):
         completed += 1
         name = os.path.basename(path)
         if data.get("_error"):
-            print(f"  [{completed}/{total}] ERROR {name}: {data['_error']}", file=sys.stderr)
+            print(
+                f"  [{completed}/{total}] ERROR {name}: {data['_error']}",
+                file=sys.stderr,
+            )
         else:
             print(f"  [{completed}/{total}] {name}", file=sys.stderr)
         # Stream JSONL immediately
@@ -166,9 +196,16 @@ def run_extract(args):
                 nonlocal chunk_completed
                 chunk_completed += 1
                 if data.get("_error"):
-                    print(f"  [{chunk_completed}/{n_chunks}] ERROR {_name} {label}: {data['_error']}", file=sys.stderr)
+                    print(
+                        f"  [{chunk_completed}/{n_chunks}] ERROR "
+                        f"{_name} {label}: {data['_error']}",
+                        file=sys.stderr,
+                    )
                 else:
-                    print(f"  [{chunk_completed}/{n_chunks}] {_name} {label}", file=sys.stderr)
+                    print(
+                        f"  [{chunk_completed}/{n_chunks}] {_name} {label}",
+                        file=sys.stderr,
+                    )
                 data["_source_file"] = _name
                 if fmt == "jsonl":
                     line = json.dumps(data)
@@ -186,13 +223,18 @@ def run_extract(args):
                     pages_per_chunk=pages_per_chunk,
                     concurrency=args.concurrency,
                     on_result=on_chunk,
+                    parser=args.parser,
                 )
             )
             all_results.extend(results)
         results = all_results
     else:
         # Standard multi-file mode
-        print(f"Petey: extracting {total} file{'s' if total > 1 else ''} with {model} (concurrency={args.concurrency})", file=sys.stderr)
+        print(
+            f"Petey: extracting {total} file{'s' if total > 1 else ''} "
+            f"with {model} (concurrency={args.concurrency})",
+            file=sys.stderr,
+        )
 
         results = asyncio.run(
             extract_batch(
@@ -201,6 +243,8 @@ def run_extract(args):
                 instructions=instructions,
                 concurrency=args.concurrency,
                 on_result=on_result,
+                parser=args.parser,
+                ocr_fallback=args.ocr_fallback,
             )
         )
 
@@ -226,22 +270,33 @@ def run_extract(args):
                 w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
                 w.writeheader()
                 w.writerows(flat)
-            print(f"Wrote {len(flat)} rows to {args.output}", file=sys.stderr)
+            print(
+                f"Wrote {len(flat)} rows to {args.output}", file=sys.stderr
+            )
         else:
-            w = csv.DictWriter(sys.stdout, fieldnames=keys, extrasaction="ignore")
+            w = csv.DictWriter(
+                sys.stdout, fieldnames=keys, extrasaction="ignore"
+            )
             w.writeheader()
             w.writerows(flat)
     elif fmt == "json":
         output = json.dumps(all_records, indent=2)
         if args.output:
             Path(args.output).write_text(output)
-            print(f"Wrote {len(all_records)} records to {args.output}", file=sys.stderr)
+            print(
+                f"Wrote {len(all_records)} records to {args.output}",
+                file=sys.stderr,
+            )
         else:
             print(output)
     elif fmt == "jsonl" and not args.output:
         pass  # Already streamed in on_result
 
-    print(f"Done. {len(all_records)} records from {total} file{'s' if total > 1 else ''}.", file=sys.stderr)
+    print(
+        f"Done. {len(all_records)} records from "
+        f"{total} file{'s' if total > 1 else ''}.",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

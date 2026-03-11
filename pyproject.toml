@@ -27,6 +27,10 @@ dependencies = [
     "pydantic",
     "pyyaml",
     "python-dotenv",
+    "marker-pdf",
+    "aryn-sdk",
+    "pytesseract",
+    "Pillow",
 ]
 
 [project.urls]
@@ -40,6 +44,10 @@ dev = [
     "build",
     "twine",
 ]
+marker = ["marker-pdf"]
+aryn = ["aryn-sdk"]
+ocr = ["pytesseract", "Pillow"]
+all-parsers = ["marker-pdf", "aryn-sdk", "pytesseract", "Pillow"]
 
 [tool.setuptools.packages.find]
 include = ["petey*"]
