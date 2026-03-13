@@ -27,7 +27,6 @@ dependencies = [
     "pydantic",
     "pyyaml",
     "python-dotenv",
-    "marker-pdf",
     "aryn-sdk",
     "pytesseract",
     "Pillow",

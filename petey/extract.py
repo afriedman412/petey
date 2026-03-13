@@ -169,11 +169,13 @@ async def extract_async(
     parser: str = "pymupdf",
     aryn_api_key: str | None = None,
     ocr_fallback: bool = False,
+    text: str | None = None,
 ) -> BaseModel:
     """Extract structured data from a PDF."""
-    text = await _extract_text_async(
-        pdf_path, parser, aryn_api_key, ocr_fallback=ocr_fallback
-    )
+    if text is None:
+        text = await _extract_text_async(
+            pdf_path, parser, aryn_api_key, ocr_fallback=ocr_fallback
+        )
     client = _make_client(model, api_key)
     return await client.chat.completions.create(
         model=model,
