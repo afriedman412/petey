@@ -43,10 +43,9 @@ dev = [
     "build",
     "twine",
 ]
-marker = ["marker-pdf"]
 aryn = ["aryn-sdk"]
 ocr = ["pytesseract", "Pillow"]
-all-parsers = ["marker-pdf", "aryn-sdk", "pytesseract", "Pillow"]
+all-parsers = ["aryn-sdk", "pytesseract", "Pillow"]
 
 [tool.setuptools.packages.find]
 include = ["petey*"]

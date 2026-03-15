@@ -339,52 +339,13 @@ class TestParsers:
         assert len(pages) >= 1
         assert any("WESTCHESTER COUNTY" in p for p in pages)
 
-    # --- marker (mocked) ---
+    # --- docparse (mocked) ---
 
-    def test_marker_calls_converter(self):
-        fake_rendered = MagicMock()
-        fake_rendered.markdown = "marker output text"
-        fake_converter = MagicMock(return_value=fake_rendered)
-        fake_converter_cls = MagicMock(return_value=fake_converter)
-
-        with patch.dict("sys.modules", {
-            "marker": MagicMock(),
-            "marker.converters": MagicMock(),
-            "marker.converters.pdf": MagicMock(PdfConverter=fake_converter_cls),
-            "marker.models": MagicMock(create_model_dict=MagicMock(return_value={})),
-        }):
-            text = extract_text(str(MCI_PDF), parser="marker")
-        assert text == "marker output text"
-
-    def test_marker_pages_returns_single_element(self):
-        fake_rendered = MagicMock()
-        fake_rendered.markdown = "marker full doc"
-        fake_converter = MagicMock(return_value=fake_rendered)
-        fake_converter_cls = MagicMock(return_value=fake_converter)
-
-        with patch.dict("sys.modules", {
-            "marker": MagicMock(),
-            "marker.converters": MagicMock(),
-            "marker.converters.pdf": MagicMock(PdfConverter=fake_converter_cls),
-            "marker.models": MagicMock(create_model_dict=MagicMock(return_value={})),
-        }):
-            pages = extract_text_pages(str(MCI_PDF), parser="marker")
-        assert pages == ["marker full doc"]
-
-    def test_marker_import_error(self):
-        with patch.dict("sys.modules", {"marker": None,
-                                        "marker.converters": None,
-                                        "marker.converters.pdf": None}):
-            with pytest.raises(ImportError, match="marker-pdf"):
-                extract_text(str(MCI_PDF), parser="marker")
-
-    # --- aryn (mocked) ---
-
-    def test_aryn_calls_partition(self):
+    def test_docparse_calls_partition(self):
         fake_result = {
             "elements": [
-                {"text_representation": "aryn block one"},
-                {"text_representation": "aryn block two"},
+                {"text_representation": "docparse block one"},
+                {"text_representation": "docparse block two"},
                 {"text_representation": ""},  # empty — should be filtered
             ]
         }
@@ -394,25 +355,25 @@ class TestParsers:
             "aryn_sdk": MagicMock(),
             "aryn_sdk.partition": MagicMock(partition_file=fake_partition),
         }):
-            text = extract_text(str(MCI_PDF), parser="aryn")
-        assert "aryn block one" in text
-        assert "aryn block two" in text
+            text = extract_text(str(MCI_PDF), parser="docparse")
+        assert "docparse block one" in text
+        assert "docparse block two" in text
         # Empty text_representation filtered out
         assert text.count("\n\n") == 1
 
-    def test_aryn_pages_returns_single_element(self):
-        fake_result = {"elements": [{"text_representation": "aryn text"}]}
+    def test_docparse_pages_returns_single_element(self):
+        fake_result = {"elements": [{"text_representation": "docparse text"}]}
         fake_partition = MagicMock(return_value=fake_result)
 
         with patch.dict("sys.modules", {
             "aryn_sdk": MagicMock(),
             "aryn_sdk.partition": MagicMock(partition_file=fake_partition),
         }):
-            pages = extract_text_pages(str(MCI_PDF), parser="aryn")
-        assert pages == ["aryn text"]
+            pages = extract_text_pages(str(MCI_PDF), parser="docparse")
+        assert pages == ["docparse text"]
 
-    def test_aryn_uses_env_api_key(self, monkeypatch):
-        monkeypatch.setenv("ARYN_API_KEY", "test-key-123")
+    def test_docparse_uses_env_api_key(self, monkeypatch):
+        monkeypatch.setenv("DOCPARSE_API_KEY", "test-key-123")
         fake_result = {"elements": [{"text_representation": "text"}]}
         fake_partition = MagicMock(return_value=fake_result)
 
@@ -420,15 +381,15 @@ class TestParsers:
             "aryn_sdk": MagicMock(),
             "aryn_sdk.partition": MagicMock(partition_file=fake_partition),
         }):
-            extract_text(str(MCI_PDF), parser="aryn")
+            extract_text(str(MCI_PDF), parser="docparse")
         _, kwargs = fake_partition.call_args
         assert kwargs.get("aryn_api_key") == "test-key-123"
 
-    def test_aryn_import_error(self):
+    def test_docparse_import_error(self):
         with patch.dict("sys.modules", {"aryn_sdk": None,
                                         "aryn_sdk.partition": None}):
             with pytest.raises(ImportError, match="aryn-sdk"):
-                extract_text(str(MCI_PDF), parser="aryn")
+                extract_text(str(MCI_PDF), parser="docparse")
 
     # --- OCR fallback ---
 

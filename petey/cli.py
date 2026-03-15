@@ -102,7 +102,7 @@ def main():
     )
     ext.add_argument(
         "--parser", default="pymupdf",
-        choices=["pymupdf", "marker", "aryn"],
+        choices=["pymupdf", "docparse"],
         help="PDF parser backend (default: pymupdf)",
     )
     ext.add_argument(
