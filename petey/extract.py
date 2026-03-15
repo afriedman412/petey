@@ -180,6 +180,7 @@ async def extract_pages_async(
     concurrency: int = 10,
     on_result=None,
     parser: str = "pymupdf",
+    header_pages: int = 0,
 ) -> list[dict]:
     """
     Split a PDF into page chunks and extract each concurrently.
@@ -189,14 +190,19 @@ async def extract_pages_async(
         concurrency: Max concurrent API calls.
         on_result: Optional callback(chunk_label, data_dict) called as each
             chunk completes.
+        header_pages: Number of leading pages to treat as a header. Their
+            text is prepended to every chunk so the LLM has document context.
 
     Returns list of result dicts (with _page and optionally _error).
     """
     pages = extract_text_pages(pdf_path, parser)
+    header_text = "\n\n".join(pages[:header_pages]) if header_pages > 0 else ""
     chunks = []
-    for i in range(0, len(pages), pages_per_chunk):
+    for i in range(header_pages, len(pages), pages_per_chunk):
         chunk_pages = pages[i: i + pages_per_chunk]
         text = "\n\n".join(chunk_pages)
+        if header_text:
+            text = header_text + "\n\n" + text
         start = i + 1
         end = min(i + pages_per_chunk, len(pages))
         label = f"p{start}" if start == end else f"p{start}-{end}"

@@ -224,6 +224,7 @@ def run_extract(args):
                     concurrency=args.concurrency,
                     on_result=on_chunk,
                     parser=args.parser,
+                    header_pages=spec.get("header_pages", 0),
                 )
             )
             all_results.extend(results)
