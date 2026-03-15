@@ -85,9 +85,10 @@ def _extract_text_docparse(pdf_path: str, api_key: str | None = None) -> str:
             "aryn-sdk is required for parser='docparse'. "
             "Install it with: pip install aryn-sdk"
         )
-    key = api_key or os.environ.get("DOCPARSE_API_KEY")
+    key = api_key or os.environ.get("DOCPARSE_API_KEY") or os.environ.get("ARYN_API_KEY")
+    kwargs = {"aryn_api_key": key} if key else {}
     with open(pdf_path, "rb") as f:
-        result = partition_file(f, aryn_api_key=key)
+        result = partition_file(f, **kwargs)
     texts = [
         el.get("text_representation", "")
         for el in result.get("elements", [])
