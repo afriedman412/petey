@@ -4,6 +4,7 @@ Configure via environment variables or pass explicitly.
 """
 import asyncio
 import os
+import warnings
 
 import fitz
 import instructor
@@ -29,8 +30,6 @@ def extract_text(
     parser: str = "pymupdf",
     ocr_fallback: bool = False,
 ) -> str:
-    if parser == "docparse":
-        return _extract_text_docparse(pdf_path)
     doc = fitz.open(pdf_path)
     text = "\n\n".join(page.get_text("text") for page in doc)
     if ocr_fallback and len(text.strip()) < OCR_THRESHOLD:
@@ -44,8 +43,6 @@ def extract_text_pages(
     ocr_fallback: bool = False,
 ) -> list[str]:
     """Extract text from each page of a PDF separately."""
-    if parser == "docparse":
-        return [_extract_text_docparse(pdf_path)]
     doc = fitz.open(pdf_path)
     pages = []
     for page in doc:
@@ -77,38 +74,11 @@ def _ocr_page(page) -> str:
     return pytesseract.image_to_string(img)
 
 
-def _extract_text_docparse(pdf_path: str, api_key: str | None = None) -> str:
-    try:
-        from aryn_sdk.partition import partition_file
-    except ImportError:
-        raise ImportError(
-            "aryn-sdk is required for parser='docparse'. "
-            "Install it with: pip install aryn-sdk"
-        )
-    key = api_key or os.environ.get("DOCPARSE_API_KEY") or os.environ.get("ARYN_API_KEY")
-    kwargs = {"aryn_api_key": key} if key else {}
-    with open(pdf_path, "rb") as f:
-        result = partition_file(f, **kwargs)
-    texts = [
-        el.get("text_representation", "")
-        for el in result.get("elements", [])
-        if el.get("text_representation")
-    ]
-    return "\n\n".join(texts)
-
-
 async def _extract_text_async(
     pdf_path: str,
     parser: str = "pymupdf",
-    docparse_api_key: str | None = None,
     ocr_fallback: bool = False,
 ) -> str:
-    """Async text extraction — runs DocParse in a thread to avoid blocking."""
-    if parser == "docparse":
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, lambda: _extract_text_docparse(pdf_path, docparse_api_key)
-        )
     return extract_text(pdf_path, parser, ocr_fallback=ocr_fallback)
 
 
@@ -152,14 +122,20 @@ async def extract_async(
     api_key: str | None = None,
     instructions: str = "",
     parser: str = "pymupdf",
-    docparse_api_key: str | None = None,
     ocr_fallback: bool = False,
     text: str | None = None,
 ) -> BaseModel:
     """Extract structured data from a PDF."""
     if text is None:
         text = await _extract_text_async(
-            pdf_path, parser, docparse_api_key, ocr_fallback=ocr_fallback
+            pdf_path, parser, ocr_fallback=ocr_fallback
+        )
+    if len(text) > TEXT_WARN_THRESHOLD:
+        warnings.warn(
+            f"Document is large ({len(text):,} chars). "
+            "Results may be incomplete. For tabular schemas, "
+            "use extract_pages_async() instead.",
+            stacklevel=2,
         )
     client = _make_client(model, api_key)
     return await client.chat.completions.create(
@@ -179,7 +155,6 @@ def extract(
     api_key: str | None = None,
     instructions: str = "",
     parser: str = "pymupdf",
-    docparse_api_key: str | None = None,
     ocr_fallback: bool = False,
 ) -> BaseModel:
     """Sync wrapper around extract_async."""
@@ -187,8 +162,7 @@ def extract(
         extract_async(
             pdf_path, response_model,
             model=model, api_key=api_key, instructions=instructions,
-            parser=parser, docparse_api_key=docparse_api_key,
-            ocr_fallback=ocr_fallback,
+            parser=parser, ocr_fallback=ocr_fallback,
         )
     )
 
@@ -206,7 +180,6 @@ async def extract_pages_async(
     concurrency: int = 10,
     on_result=None,
     parser: str = "pymupdf",
-    docparse_api_key: str | None = None,
 ) -> list[dict]:
     """
     Split a PDF into page chunks and extract each concurrently.
@@ -269,7 +242,6 @@ async def extract_batch(
     concurrency: int = 10,
     on_result=None,
     parser: str = "pymupdf",
-    docparse_api_key: str | None = None,
     ocr_fallback: bool = False,
 ) -> list[dict]:
     """
@@ -278,9 +250,8 @@ async def extract_batch(
     Args:
         on_result: Optional callback(path, data_dict) called as each file completes.
         concurrency: Max concurrent API calls.
-        parser: PDF text extraction backend ('pymupdf' or 'docparse').
-        docparse_api_key: DocParse API key (or set DOCPARSE_API_KEY env var).
-        ocr_fallback: Fall back to pytesseract if pymupdf finds no text layer.
+        parser: PDF text extraction backend ('pymupdf').
+        ocr_fallback: Fall back to pytesseract if no text layer found.
 
     Returns list of result dicts (with _source_file and optionally _error).
     """
@@ -292,7 +263,7 @@ async def extract_batch(
         async with sem:
             try:
                 text = await _extract_text_async(
-                    path, parser, docparse_api_key, ocr_fallback=ocr_fallback
+                    path, parser, ocr_fallback=ocr_fallback
                 )
                 result = await client.chat.completions.create(
                     model=model,

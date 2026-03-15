@@ -27,7 +27,6 @@ dependencies = [
     "pydantic",
     "pyyaml",
     "python-dotenv",
-    "aryn-sdk",
     "pytesseract",
     "Pillow",
 ]
@@ -43,9 +42,7 @@ dev = [
     "build",
     "twine",
 ]
-aryn = ["aryn-sdk"]
 ocr = ["pytesseract", "Pillow"]
-all-parsers = ["aryn-sdk", "pytesseract", "Pillow"]
 
 [tool.setuptools.packages.find]
 include = ["petey*"]

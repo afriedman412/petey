@@ -339,58 +339,6 @@ class TestParsers:
         assert len(pages) >= 1
         assert any("WESTCHESTER COUNTY" in p for p in pages)
 
-    # --- docparse (mocked) ---
-
-    def test_docparse_calls_partition(self):
-        fake_result = {
-            "elements": [
-                {"text_representation": "docparse block one"},
-                {"text_representation": "docparse block two"},
-                {"text_representation": ""},  # empty — should be filtered
-            ]
-        }
-        fake_partition = MagicMock(return_value=fake_result)
-
-        with patch.dict("sys.modules", {
-            "aryn_sdk": MagicMock(),
-            "aryn_sdk.partition": MagicMock(partition_file=fake_partition),
-        }):
-            text = extract_text(str(MCI_PDF), parser="docparse")
-        assert "docparse block one" in text
-        assert "docparse block two" in text
-        # Empty text_representation filtered out
-        assert text.count("\n\n") == 1
-
-    def test_docparse_pages_returns_single_element(self):
-        fake_result = {"elements": [{"text_representation": "docparse text"}]}
-        fake_partition = MagicMock(return_value=fake_result)
-
-        with patch.dict("sys.modules", {
-            "aryn_sdk": MagicMock(),
-            "aryn_sdk.partition": MagicMock(partition_file=fake_partition),
-        }):
-            pages = extract_text_pages(str(MCI_PDF), parser="docparse")
-        assert pages == ["docparse text"]
-
-    def test_docparse_uses_env_api_key(self, monkeypatch):
-        monkeypatch.setenv("DOCPARSE_API_KEY", "test-key-123")
-        fake_result = {"elements": [{"text_representation": "text"}]}
-        fake_partition = MagicMock(return_value=fake_result)
-
-        with patch.dict("sys.modules", {
-            "aryn_sdk": MagicMock(),
-            "aryn_sdk.partition": MagicMock(partition_file=fake_partition),
-        }):
-            extract_text(str(MCI_PDF), parser="docparse")
-        _, kwargs = fake_partition.call_args
-        assert kwargs.get("aryn_api_key") == "test-key-123"
-
-    def test_docparse_import_error(self):
-        with patch.dict("sys.modules", {"aryn_sdk": None,
-                                        "aryn_sdk.partition": None}):
-            with pytest.raises(ImportError, match="aryn-sdk"):
-                extract_text(str(MCI_PDF), parser="docparse")
-
     # --- OCR fallback ---
 
     def test_ocr_threshold_constant(self):
