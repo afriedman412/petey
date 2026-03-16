@@ -102,8 +102,8 @@ def main():
     )
     ext.add_argument(
         "--parser", default="pymupdf",
-        choices=["pymupdf"],
-        help="PDF parser backend (default: pymupdf)",
+        choices=["pymupdf", "tables", "pdfplumber"],
+        help="PDF parser backend (default: pymupdf; array schemas default to tables)",
     )
     ext.add_argument(
         "--ocr-fallback", action="store_true",

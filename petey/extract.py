@@ -46,7 +46,12 @@ def extract_text_pages(
 
     parser="tables" uses PyMuPDF table detection to preserve column alignment,
     falling back to plain text for pages with no detected tables.
+    parser="pdfplumber" uses pdfplumber's bounding-box table extraction,
+    falling back to plain text for pages with no detected tables.
     """
+    if parser == "pdfplumber":
+        return _extract_text_pages_pdfplumber(pdf_path)
+
     doc = fitz.open(pdf_path)
     pages = []
     for page in doc:
@@ -71,6 +76,29 @@ def extract_text_pages(
             if ocr_fallback and len(text.strip()) < OCR_THRESHOLD:
                 text = _ocr_page(page)
         pages.append(text)
+    return pages
+
+
+def _extract_text_pages_pdfplumber(pdf_path: str) -> list[str]:
+    """Extract per-page text using pdfplumber's layout-preserving mode.
+
+    Uses layout=True which positions text spatially, preserving column
+    alignment for borderless tables without needing explicit table detection.
+    Falls back to plain extract_text() for pages where layout extraction
+    returns nothing.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        raise ImportError(
+            "pdfplumber is required for parser='pdfplumber'. "
+            "Install it with: pip install pdfplumber"
+        )
+    pages = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text(layout=True) or page.extract_text() or ""
+            pages.append(text)
     return pages
 
 
