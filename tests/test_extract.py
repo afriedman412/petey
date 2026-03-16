@@ -2,6 +2,7 @@
 Tests for the petey package.
 Tests text extraction and schema building using MCI page 1 as test data.
 """
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -71,7 +72,7 @@ class TestBuildModel:
 
     def test_enum_with_values(self):
         spec = {"fields": {"status": {
-            "type": "enum",
+            "type": "category",
             "values": ["Open", "Closed"],
             "description": "Status",
         }}}
@@ -80,7 +81,9 @@ class TestBuildModel:
         assert "status_enum" in str(schema)
 
     def test_enum_without_values_falls_back_to_string(self):
-        spec = {"fields": {"status": {"type": "enum", "description": "Status"}}}
+        spec = {"fields": {"status": {
+            "type": "category", "description": "Status",
+        }}}
         model = build_model(spec)
         schema = model.model_json_schema()
         assert "status_enum" not in str(schema)
@@ -119,7 +122,11 @@ class TestBuildModel:
                 "docket_number": {"type": "string", "description": "Docket number"},
                 "case_status": {"type": "string", "description": "Case status"},
                 "closing_date": {"type": "date", "description": "Closing date"},
-                "close_code": {"type": "enum", "values": ["GP", "GR", "VO"], "description": "Close code"},
+                "close_code": {
+                    "type": "category",
+                    "values": ["GP", "GR", "VO"],
+                    "description": "Close code",
+                },
                 "monthly_mci_incr_per_room": {"type": "number", "description": "Monthly increase per room"},
                 "mci_items": {
                     "type": "array",
@@ -214,6 +221,28 @@ class TestProviderDetection:
     def test_openai_default(self):
         from petey.extract import _get_provider
         assert _get_provider("some-other-model") == "openai"
+
+    def test_litellm_gemini(self):
+        from petey.extract import _get_provider
+        assert _get_provider("gemini/gemini-2.0-flash") == "litellm"
+
+    def test_litellm_ollama(self):
+        from petey.extract import _get_provider
+        assert _get_provider("ollama/llama3") == "litellm"
+
+    def test_litellm_bedrock(self):
+        from petey.extract import _get_provider
+        assert _get_provider("bedrock/anthropic.claude-v2") == "litellm"
+
+    def test_explicit_backend_override(self):
+        from petey.extract import _get_provider
+        assert _get_provider("gpt-4.1-mini", llm_backend="litellm") == "litellm"
+        assert _get_provider("claude-sonnet-4-6", llm_backend="openai") == "openai"
+
+    def test_litellm_client_created(self):
+        from petey.extract import _make_client
+        client = _make_client("gemini/gemini-2.0-flash")
+        assert client is not None
 
 
 class TestMakeMessages:
@@ -339,30 +368,84 @@ class TestParsers:
         assert len(pages) >= 1
         assert any("WESTCHESTER COUNTY" in p for p in pages)
 
-    # --- OCR fallback ---
+    # --- tabula ---
+
+    def test_tabula_import_error(self):
+        with patch.dict("sys.modules", {"tabula": None}):
+            with pytest.raises(ImportError, match="petey\\[tabula\\]"):
+                extract_text(str(MCI_PDF), parser="tabula")
+
+    def test_tabula_pages_import_error(self):
+        with patch.dict("sys.modules", {"tabula": None}):
+            with pytest.raises(ImportError, match="petey\\[tabula\\]"):
+                extract_text_pages(str(MCI_PDF), parser="tabula")
+
+    def test_tabula_calls_read_pdf(self):
+        mock_tabula = MagicMock()
+        # Mock a DataFrame-like object with to_csv
+        mock_df = MagicMock()
+        mock_df.to_csv.return_value = "col\nval"
+        mock_tabula.read_pdf.return_value = [mock_df]
+        with patch.dict("sys.modules", {"tabula": mock_tabula}):
+            pages = extract_text_pages(str(MCI_PDF), parser="tabula")
+        assert isinstance(pages, list)
+        assert len(pages) >= 1
+
+    # --- OCR backends ---
 
     def test_ocr_threshold_constant(self):
         assert OCR_THRESHOLD == 100
 
     def test_ocr_not_triggered_when_text_present(self):
         # MCI PDF has plenty of text — OCR should never be called
-        with patch("petey.extract._ocr_pymupdf") as mock_ocr:
-            text = extract_text(str(MCI_PDF), parser="pymupdf", ocr_fallback=True)
+        with patch("petey.extract._ocr_full") as mock_ocr:
+            text = extract_text(
+                str(MCI_PDF), parser="pymupdf", ocr_fallback=True,
+            )
+        mock_ocr.assert_not_called()
+        assert "WESTCHESTER COUNTY" in text
+
+    def test_ocr_not_triggered_with_ocr_backend(self):
+        with patch("petey.extract._ocr_full") as mock_ocr:
+            text = extract_text(
+                str(MCI_PDF), parser="pymupdf",
+                ocr_backend="tesseract",
+            )
         mock_ocr.assert_not_called()
         assert "WESTCHESTER COUNTY" in text
 
     def test_ocr_triggered_when_no_text(self, tmp_path):
-        # Create a PDF with no text layer
         import fitz
         doc = fitz.open()
         doc.new_page()
         blank_pdf = tmp_path / "blank.pdf"
         doc.save(str(blank_pdf))
 
-        with patch("petey.extract._ocr_pymupdf", return_value="ocr result") as mock_ocr:
-            text = extract_text(str(blank_pdf), parser="pymupdf", ocr_fallback=True)
+        with patch(
+            "petey.extract._ocr_page", return_value="ocr result"
+        ) as mock_ocr:
+            text = extract_text(
+                str(blank_pdf), parser="pymupdf", ocr_fallback=True,
+            )
         mock_ocr.assert_called_once()
-        assert text == "ocr result"
+        assert "ocr result" in text
+
+    def test_ocr_triggered_with_ocr_backend(self, tmp_path):
+        import fitz
+        doc = fitz.open()
+        doc.new_page()
+        blank_pdf = tmp_path / "blank.pdf"
+        doc.save(str(blank_pdf))
+
+        with patch(
+            "petey.extract._ocr_page", return_value="ocr result"
+        ) as mock_ocr:
+            text = extract_text(
+                str(blank_pdf), parser="pymupdf",
+                ocr_backend="tesseract",
+            )
+        mock_ocr.assert_called_once()
+        assert "ocr result" in text
 
     def test_ocr_not_triggered_when_fallback_disabled(self, tmp_path):
         import fitz
@@ -371,19 +454,57 @@ class TestParsers:
         blank_pdf = tmp_path / "blank.pdf"
         doc.save(str(blank_pdf))
 
-        with patch("petey.extract._ocr_pymupdf") as mock_ocr:
-            extract_text(str(blank_pdf), parser="pymupdf", ocr_fallback=False)
+        with patch("petey.extract._ocr_page") as mock_ocr:
+            extract_text(
+                str(blank_pdf), parser="pymupdf", ocr_fallback=False,
+            )
         mock_ocr.assert_not_called()
 
-    def test_ocr_import_error(self, tmp_path):
-        import fitz
-        doc = fitz.open()
-        doc.new_page()
-        blank_pdf = tmp_path / "blank.pdf"
-        doc.save(str(blank_pdf))
+    def test_ocr_backend_resolve_fallback(self):
+        from petey.extract import _resolve_ocr_backend
+        assert _resolve_ocr_backend(True, "none") == "tesseract"
+        assert _resolve_ocr_backend(False, "none") == "none"
+        assert _resolve_ocr_backend(True, "mistral") == "mistral"
+        assert _resolve_ocr_backend(False, "tesseract") == "tesseract"
 
-        with patch.dict("sys.modules", {"pytesseract": None, "PIL": None}):
-            with pytest.raises(ImportError, match="petey\\[ocr\\]"):
-                extract_text(
-                    str(blank_pdf), parser="pymupdf", ocr_fallback=True
-                )
+    def test_mistral_ocr_import_error(self):
+        from petey.extract import _ocr_page_mistral
+        mock_page = MagicMock()
+        with patch.dict("sys.modules", {"mistralai": None}):
+            with pytest.raises(
+                ImportError, match="petey\\[mistral-ocr\\]"
+            ):
+                _ocr_page_mistral(mock_page)
+
+    def test_mistral_ocr_missing_api_key(self):
+        from petey.extract import _ocr_page_mistral
+        mock_mistralai = MagicMock()
+        mock_page = MagicMock()
+        with patch.dict("sys.modules", {"mistralai": mock_mistralai}):
+            with patch.dict(os.environ, {}, clear=True):
+                with pytest.raises(ValueError, match="MISTRAL_API_KEY"):
+                    _ocr_page_mistral(mock_page)
+
+    def test_ocr_backend_falls_back_to_pdfplumber(self):
+        """When --ocr is set with pymupdf parser, should switch to pdfplumber
+        to avoid pymupdf4llm's built-in OCR."""
+        with patch("petey.extract.pymupdf4llm") as mock_p4l:
+            pages = extract_text_pages(
+                str(MCI_PDF), parser="pymupdf", ocr_backend="tesseract",
+            )
+            # pymupdf4llm should NOT be called — pdfplumber is used instead
+            mock_p4l.to_markdown.assert_not_called()
+            # Should still return page content (from pdfplumber)
+            assert isinstance(pages, list)
+            assert len(pages) >= 1
+
+    def test_pymupdf_used_when_no_ocr_backend(self):
+        """Without --ocr, pymupdf4llm should be used as normal."""
+        with patch("petey.extract.pymupdf4llm") as mock_p4l:
+            mock_p4l.to_markdown.return_value = [
+                {"text": "x" * 200}
+            ]
+            extract_text_pages(
+                str(MCI_PDF), parser="pymupdf", ocr_backend="none",
+            )
+            mock_p4l.to_markdown.assert_called_once()
