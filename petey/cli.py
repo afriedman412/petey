@@ -102,12 +102,30 @@ def main():
     )
     ext.add_argument(
         "--parser", default="pymupdf",
-        choices=["pymupdf", "tables", "pdfplumber"],
-        help="PDF parser backend (default: pymupdf; array schemas default to tables)",
+        choices=["pymupdf", "tables", "pdfplumber", "tabula"],
+        help=(
+            "PDF text extraction backend (default: pymupdf; "
+            "array schemas default to tables)"
+        ),
     )
     ext.add_argument(
         "--ocr-fallback", action="store_true",
-        help="Fall back to pytesseract OCR if pymupdf finds no text",
+        help="Deprecated. Use --ocr tesseract instead.",
+    )
+    ext.add_argument(
+        "--ocr", dest="ocr_backend", default="none",
+        choices=["none", "tesseract", "mistral"],
+        help=(
+            "OCR backend for scanned pages "
+            "(default: none)"
+        ),
+    )
+    ext.add_argument(
+        "--llm-backend", "-b", default=None,
+        choices=["openai", "anthropic", "litellm"],
+        help=(
+            "LLM backend (default: auto-detect from model name)"
+        ),
     )
 
     args = parser.parse_args()
@@ -170,6 +188,11 @@ def run_extract(args):
                 print(line)
 
     instructions = args.instructions or spec.get("instructions", "")
+    ocr_backend = args.ocr_backend
+    if args.ocr_fallback and ocr_backend == "none":
+        ocr_backend = "tesseract"
+    llm_backend = args.llm_backend
+
     # Use "tables" parser by default for array schemas; allow explicit override
     if args.parser != "pymupdf":
         parser = args.parser
@@ -181,18 +204,30 @@ def run_extract(args):
     if pages_per_chunk is None and is_array:
         pages_per_chunk = 1
 
+    # Build a summary of non-default options for status messages
+    extras = []
+    if parser != "pymupdf":
+        extras.append(f"parser={parser}")
+    if ocr_backend != "none":
+        extras.append(f"ocr={ocr_backend}")
+    if llm_backend:
+        extras.append(f"backend={llm_backend}")
+    opts = f"concurrency={args.concurrency}"
+    if extras:
+        opts = ", ".join(extras) + ", " + opts
+
     if pages_per_chunk:
         # Page-chunked mode: split each PDF into chunks, extract concurrently
         all_results = []
         for pdf in pdfs:
-            from petey.extract import extract_text_pages
-            n_pages = len(extract_text_pages(pdf))
+            import fitz
+            n_pages = len(fitz.open(pdf))
             n_chunks = -(-n_pages // pages_per_chunk)  # ceil division
             pdf_name = os.path.basename(pdf)
             print(
                 f"Petey: splitting {pdf_name} into {n_chunks} chunk(s) "
                 f"({pages_per_chunk} page(s) each, {n_pages} pages total) "
-                f"with {model} (concurrency={args.concurrency})",
+                f"with {model} ({opts})",
                 file=sys.stderr,
             )
             chunk_completed = 0
@@ -229,6 +264,8 @@ def run_extract(args):
                     concurrency=args.concurrency,
                     on_result=on_chunk,
                     parser=parser,
+                    ocr_backend=ocr_backend,
+                    llm_backend=llm_backend,
                     header_pages=spec.get("header_pages", 0),
                     page_range=spec.get("pages") or None,
                 )
@@ -239,7 +276,7 @@ def run_extract(args):
         # Standard multi-file mode
         print(
             f"Petey: extracting {total} file{'s' if total > 1 else ''} "
-            f"with {model} (concurrency={args.concurrency})",
+            f"with {model} ({opts})",
             file=sys.stderr,
         )
 
@@ -251,7 +288,8 @@ def run_extract(args):
                 concurrency=args.concurrency,
                 on_result=on_result,
                 parser=args.parser,
-                ocr_fallback=args.ocr_fallback,
+                ocr_backend=ocr_backend,
+                llm_backend=llm_backend,
             )
         )
 

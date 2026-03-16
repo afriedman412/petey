@@ -18,7 +18,7 @@ def _build_field(name: str, cfg: dict) -> tuple:
     ftype = cfg["type"]
     desc = cfg.get("description", "")
 
-    if ftype == "enum":
+    if ftype in ("category", "enum"):
         values = cfg.get("values", [])
         if values:
             enum_cls = enum.Enum(

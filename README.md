@@ -18,6 +18,38 @@ As it turns out, AI can be a big help here. It turns out you don't need a partic
 
 Petey wires everything together for you. Just pass it your files and a schema that explains what you want, and it will return a JSON or CSV with your data.
 
+## Architecture
+### Text Extractors
+
+The first step is getting text out of the PDF. Different extractors work better for different document types.
+
+| Parser | Install | Best for | How it works |
+|--------|---------|----------|--------------|
+| `pymupdf` | included | Most documents | Reads the embedded text layer directly. Fast and reliable. Default for single-record schemas. |
+| `tables` | included | Bordered tables | Uses PyMuPDF's table detection to find cells and extract them as TSV. Falls back to plain text for pages without tables. Default for array schemas. |
+| `pdfplumber` | included | Borderless tables | Layout-preserving extraction that positions text spatially. Good for documents where columns are aligned by whitespace rather than cell borders. |
+| `tabula` | `pip install petey[tabula]` | Structured tables | Uses tabula-py (Java-based) to detect and extract tables as DataFrames. Falls back to pymupdf for pages without tables. Requires Java. |
+
+### OCR Backends
+
+If a PDF has no embedded text layer (e.g. a scanned document), Petey can fall back to OCR. OCR is only triggered when the extracted text is very short (< 100 characters), so it won't slow down documents that already have text.
+
+| Backend | Install | How it works |
+|---------|---------|--------------|
+| `none` | — | No OCR. Default. |
+| `tesseract` | included | Local OCR via pytesseract. Requires the Tesseract binary installed on your system. |
+| `mistral` | `pip install petey[mistral-ocr]` | Cloud OCR via Mistral's `mistral-ocr-latest` model. Sends page images to the Mistral API. Requires `MISTRAL_API_KEY`. |
+
+### LLM Backends
+
+The LLM interprets the extracted text and returns structured data matching your schema. Petey auto-detects the right backend from the model name, or you can set it explicitly.
+
+| Backend | Install | Models | Auto-detected when |
+|---------|---------|--------|--------------------|
+| `openai` | included | `gpt-4.1-mini`, `gpt-4o`, etc. | Model name doesn't match other patterns (default) |
+| `anthropic` | included | `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, etc. | Model starts with `claude` |
+| `litellm` | included | Gemini, Mistral, Ollama, Bedrock, Vertex AI, Cohere, 100+ more | Model starts with `gemini/`, `mistral/`, `ollama/`, `bedrock/`, etc. |
+
 ## Setup
 
 Add your API key to a `.env` file in your working directory:
@@ -32,13 +64,17 @@ Or for Anthropic:
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
+Or for any provider via litellm (e.g. Gemini):
+
+```
+GEMINI_API_KEY=...
+```
+
 Petey defaults to `gpt-4.1-mini`, which is fast and cheap and handles most documents well. To use a different model, pass `--model` on the CLI or set a default in `.env`:
 
 ```
 PETEY_MODEL=claude-sonnet-4-5
 ```
-
-Any OpenAI or Anthropic model ID works. Step up to a larger model if you're seeing errors on complex or dense documents.
 
 ## Schemas
 
@@ -56,7 +92,7 @@ fields:
   date:
     type: date
   status:
-    type: enum
+    type: category
     values: [Paid, Unpaid, Overdue]
 ```
 
@@ -67,7 +103,7 @@ fields:
 | `string` | Any text value |
 | `number` | Integer or decimal |
 | `date` | Returns ISO 8601 format |
-| `enum` | Constrained set of values; optionally list `values:` to enforce them |
+| `category` | Constrained set of values; optionally list `values:` to enforce them |
 
 All fields are nullable — Petey returns `null` for anything it can't find rather than guessing.
 
@@ -79,7 +115,7 @@ All fields are nullable — Petey returns `null` for anything it can't find rath
 | `instructions` | Extra guidance appended to the prompt (e.g. "ignore the summary row") |
 | `header_pages` | Number of leading pages to treat as a document header (see below) |
 | `pages` | Page range to process, e.g. `"2-5"` or `"1,3,5-7"` (1-indexed) |
-| `parser` | Text extraction backend: `pymupdf` (default), `tables`, or `pdfplumber` |
+| `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, or `tabula` |
 
 ## Use Cases
 
@@ -102,7 +138,7 @@ fields:
   amount_due:
     type: number
   status:
-    type: enum
+    type: category
     values: [Paid, Unpaid, Overdue]
 ```
 
@@ -135,6 +171,37 @@ petey extract --schema transactions.yaml statement.pdf -o results.csv
 
 You can point this at a folder of files and Petey will combine all the rows into a single output, with a `_source_file` column on each row. Use `pages` to target a specific range if the table only occupies part of the document (e.g. `pages: "3-22"`).
 
+### Scanned documents
+
+If your PDFs are scanned images with no text layer, use an OCR backend:
+
+```bash
+# Local OCR with Tesseract
+petey extract --schema schema.yaml --ocr tesseract ./scans/ -o results.csv
+
+# Cloud OCR with Mistral (better quality, requires API key)
+petey extract --schema schema.yaml --ocr mistral ./scans/ -o results.csv
+```
+
+### Using different LLM providers
+
+```bash
+# OpenAI (default)
+petey extract --schema schema.yaml --model gpt-4.1-mini ./pdfs/
+
+# Anthropic
+petey extract --schema schema.yaml --model claude-sonnet-4-6 ./pdfs/
+
+# Gemini via litellm
+petey extract --schema schema.yaml --model gemini/gemini-2.0-flash ./pdfs/
+
+# Ollama (local)
+petey extract --schema schema.yaml --model ollama/llama3 ./pdfs/
+
+# Explicit backend override
+petey extract --schema schema.yaml --model my-model --llm-backend litellm ./pdfs/
+```
+
 ## CLI Reference
 
 ```bash
@@ -149,13 +216,38 @@ petey extract --schema schema.yaml ./pdfs/ -o results.csv
 | `--output / -o` | stdout | Output file path |
 | `--format / -f` | inferred | `csv`, `json`, or `jsonl` |
 | `--instructions / -i` | — | Extra extraction instructions |
-| `--parser` | `pymupdf` | PDF text extraction backend |
-| `--ocr-fallback` | off | Fall back to OCR if no text layer is found |
+| `--parser` | `pymupdf` | Text extraction backend (`pymupdf`, `tables`, `pdfplumber`, `tabula`) |
+| `--ocr` | `none` | OCR backend (`none`, `tesseract`, `mistral`) |
+| `--llm-backend / -b` | auto-detect | LLM backend (`openai`, `anthropic`, `litellm`) |
+| `--pages-per-chunk / -p` | `1` for arrays | Pages per LLM call (set to `0` to disable chunking) |
 
-## Notes
+## Python API
 
-**Who this is for.** Petey is aimed at someone who has a large collection of PDFs that all share the same format and wants a reliable, low-effort way to get the data out of them.
+```python
+from petey import extract, load_schema
 
-**Cheap and good, but not fast.** Every page goes through an LLM API call. That makes Petey accurate and cheap — a large batch costs a few dollars, not hundreds — but it is not fast in the way a pure parser would be. Processing thousands of documents takes time. Petey runs extractions concurrently to keep throughput up, but if raw speed is the constraint, an LLM-based approach may not be the right tool.
+# load_schema returns a Pydantic model class and the raw spec dict
+schema, spec = load_schema("invoice.yaml")
 
-**Designed to be modular.** Petey is a framework as much as a tool. The PDF-to-text step, the OCR fallback, and the LLM backend are all swappable. The parser option (`pymupdf`, `tables`, `pdfplumber`) lets you choose how text is extracted before it ever reaches the model. The model flag lets you swap in any OpenAI or Anthropic model. The schema drives everything else. The goal is to make it easy to tune each layer independently as your documents and requirements change.
+# Basic extraction
+result = extract("invoice.pdf", schema)
+
+# With options
+result = extract(
+    "invoice.pdf",
+    schema,
+    model="claude-sonnet-4-6",      # LLM model ID
+    parser="pdfplumber",            # text extraction backend
+    ocr_backend="mistral",          # OCR for scanned docs
+    llm_backend="litellm",          # explicit LLM backend
+    instructions="Ignore the watermark text",
+)
+```
+
+## Optional Dependencies
+
+```bash
+pip install petey                    # Core (includes tesseract OCR + litellm)
+pip install petey[mistral-ocr]       # + Mistral OCR
+pip install petey[tabula]            # + Tabula table extraction (requires Java)
+```
