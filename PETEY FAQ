@@ -2,23 +2,22 @@ Meet Petey. Petey gets your data out of PDFs and into formats that you can actua
 
 
 WHY PETEY?
-
-PDFS ARE AWFUL
 The PDF format was designed to look identical on any screen or printer. It was format and technology agnostic, a univeresal container for the printed page. But all that mattered was its visual presentation. As long as it rendered correctly, the internal representation didn't matter.
 
-And so if you open up a PDF, what you will see if often chaotic. It is just a bunch of items -- words, characters, shapes, images -- and their coordinates, with little or no regard for the relationship between anything. What reads as one cohesive line of text could be three groups of words that happened to be positioned sequentially with the same y-value. You have probably experienced this if you have ever tried to select text in a PDF and find yourself highlighting disconnected words on four different lines.
+And so the inside of a PDF is often chaotic. It is just a bunch of items -- words, characters, shapes, images -- and their coordinates, with little or no regard for the relationship between anything. What reads as one cohesive line of text could be three groups of words that happened to be positioned sequentially with the same y-value. You have probably experienced this if you have ever tried to select text in a PDF and find yourself highlighting disconnected words on four different lines.
 
-The PDF format improved drastically over time, as most paperwork went fully digital. Now you can download a PDF, fill it out and send it back complete with a legally binding signature. But that is cold comfort to anyone trying to work with a tranche of scanned documents from 1998.
+The primary challenge of getting your data out of a PDF is imposing some order on this code soup. A lot of hard-working folks have developed methods and tools to accomplish this over the years, finding ingenous ways to infer meaning from the relative positions of all the elements of a document. But it's tricky, precise work.
 
+As it turns out, AI can be a big help here. It turns out you don't need a particularly advanced LLM to interpret some fairly difficult PDFs. But models need infrastructure. Not everyone has time to teach themselves how to be an amateur ML engineer, even with the magic of vibe coding.
 
-AI IS POWERFUL
-A lot of hard-working folks have been developing methods and tools to get data out of PDFs for years. [TKTK] But even the best of these take a bit of technical skill to deploy, and have a learning curve for optimal use. However, AI is pretty good at filling the gaps, if not replacing the tools entirely. It turns out you don't need a particularly advanced LLM to interpret some fairly difficult PDFs.
-
-But those models need infrastructure, and even with the magic of vibe coding, not everyone has time to teach themselves how to be an amateur ML engineer. And that's why I built Petey.
+Petey wires everything together for you. Just pass it your files and a schema that explains what you want, and it will return a JSON or CSV with your data.
 
 
-WHAT IS PETEY?
-Petey is a few useful PDF-parsing tools wired together, wrapped in an interface that allows anyone to specify what they want to do in plain English. Petey is also available as a Python package for anyone who wants to build their own pipeline.
+
+
+
+
+
 
 WHAT DOES PETEY NEED FROM ME?
 All you need to supply is an Anthropic or OpenAI API key, your documents, and a schema file which tells Petey what to look for.
