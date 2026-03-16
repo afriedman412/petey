@@ -73,7 +73,7 @@ GEMINI_API_KEY=...
 Petey defaults to `gpt-4.1-mini`, which is fast and cheap and handles most documents well. To use a different model, pass `--model` on the CLI or set a default in `.env`:
 
 ```
-PETEY_MODEL=claude-sonnet-4-5
+PETEY_MODEL=claude-sonnet-4-6
 ```
 
 ## Schemas

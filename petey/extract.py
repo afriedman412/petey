@@ -379,7 +379,7 @@ def _make_client_anthropic(api_key: str | None = None):
     """Build an instructor-wrapped Anthropic async client."""
     key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     return instructor.from_anthropic(
-        AsyncAnthropic(api_key=key), max_tokens=4096,
+        AsyncAnthropic(api_key=key), max_tokens=16384,
     )
 
 
@@ -580,10 +580,18 @@ async def extract_pages_async(
         List of result dicts (with _page and optionally _error).
     """
     pages = extract_text_pages(pdf_path, parser, ocr_backend=ocr_backend)
-    header_text = (
-        "\n\n".join(pages[:header_pages]) if header_pages > 0 else ""
-    )
-
+    # Table-oriented parsers strip non-table content, so header pages
+    # (which contain prose like name/status/filing info) need the default
+    # pymupdf parser to preserve that text.
+    if header_pages > 0 and parser != "pymupdf":
+        header_pages_text = extract_text_pages(
+            pdf_path, "pymupdf", ocr_backend=ocr_backend,
+        )[:header_pages]
+        header_text = "\n\n".join(header_pages_text)
+    elif header_pages > 0:
+        header_text = "\n\n".join(pages[:header_pages])
+    else:
+        header_text = ""
     if page_range:
         content_indices = [
             i for i in _parse_page_range(page_range, len(pages))
