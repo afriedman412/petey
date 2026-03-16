@@ -521,6 +521,119 @@ def extract(
     )
 
 
+# --- Schema inference ---
+
+INFER_SCHEMA_SYSTEM = (
+    "You analyze PDF documents and suggest extraction schemas.\n"
+    "Given sample text from a document, propose a structured "
+    "schema with fields to extract.\n\n"
+    "Return valid JSON with this structure:\n"
+    "{\n"
+    '  "name": "short_snake_case_name",\n'
+    '  "record_type": "single" or "array",\n'
+    '  "instructions": "brief notes about the document format",\n'
+    '  "fields": {\n'
+    '    "field_name": {\n'
+    '      "type": "string|number|date|enum",\n'
+    '      "description": "what this field contains",\n'
+    '      "values": ["only", "for", "enum", "fields"]\n'
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "Guidelines:\n"
+    "- Use array record_type for repeating rows/records\n"
+    "- Use single if the document has one set of fields\n"
+    "- Use enum when values come from a fixed set\n"
+    "- Use date for dates, number for numbers, string otherwise\n"
+    "- Keep field names short, lowercase, snake_case\n"
+    "- Include descriptions that help an LLM find the data\n"
+    "- For checkbox/range columns, use enum with range labels\n"
+    "- Be thorough — include all extractable fields"
+)
+
+
+async def infer_schema_async(
+    pdf_path: str,
+    *,
+    model: str = "gpt-4.1-mini",
+    api_key: str | None = None,
+    parser: str = "pymupdf",
+    ocr_fallback: bool = False,
+    ocr_backend: str = "none",
+    llm_backend: str | None = None,
+    max_pages: int = 2,
+) -> dict:
+    """Analyze a PDF and suggest an extraction schema.
+
+    Reads the first ``max_pages`` pages, sends the text to
+    the LLM, and returns a schema spec dict compatible with
+    ``build_model()``.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        model: LLM model ID.
+        api_key: Optional API key override.
+        parser: Text extraction backend.
+        ocr_fallback: Fall back to OCR for low-text pages.
+        ocr_backend: OCR backend name.
+        llm_backend: LLM backend override.
+        max_pages: Number of pages to sample (default 2).
+
+    Returns:
+        Schema spec dict with name, record_type, fields, etc.
+    """
+    import json as _json
+
+    pages = extract_text_pages(
+        pdf_path, parser,
+        ocr_fallback=ocr_fallback, ocr_backend=ocr_backend,
+    )
+    sample_pages = pages[:max_pages]
+    sample = "\n\n---PAGE BREAK---\n\n".join(sample_pages)
+
+    client = _make_client(model, api_key, llm_backend)
+
+    # Use raw (unwrapped) client to get plain text back
+    raw = getattr(client, "client", client)
+    user_msg = (
+        "Analyze this document and suggest a schema:"
+        f"\n\n{sample}"
+    )
+    resp = await raw.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": INFER_SCHEMA_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0,
+        max_tokens=4096,
+    )
+
+    # Extract text content from response
+    if hasattr(resp, "content"):
+        content = resp.content[0].text
+    else:
+        content = resp.choices[0].message.content
+
+    # Parse JSON (handle markdown code blocks)
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1]
+        text = text.rsplit("```", 1)[0]
+
+    return _json.loads(text)
+
+
+def infer_schema(
+    pdf_path: str,
+    **kwargs,
+) -> dict:
+    """Sync wrapper around ``infer_schema_async``."""
+    return asyncio.run(
+        infer_schema_async(pdf_path, **kwargs)
+    )
+
+
 # --- Page-chunked extraction ---
 
 def _parse_page_range(spec: str, total_pages: int) -> list[int]:

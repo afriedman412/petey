@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "petey"
-version = "0.1.5"
+version = "0.1.6"
 description = "Petey — The Easy PDF Extractor"
 readme = "README.md"
 license = "MIT"

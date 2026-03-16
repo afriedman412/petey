@@ -16,8 +16,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import yaml
+
 from petey.schema import load_schema
-from petey.extract import extract_batch, extract_pages_async
+from petey.extract import (
+    extract_batch, extract_pages_async, infer_schema,
+)
 
 
 def _collect_pdfs(paths: list[str]) -> list[str]:
@@ -127,6 +131,48 @@ def main():
             "LLM backend (default: auto-detect from model name)"
         ),
     )
+    ext.add_argument(
+        "--header-pages", type=int, default=None,
+        help="Header pages to prepend to each chunk",
+    )
+    ext.add_argument(
+        "--page-range", default=None,
+        help="Page range to extract (e.g. 2-5 or 1,3,5-7)",
+    )
+
+    # --- infer-schema subcommand ---
+    inf = sub.add_parser(
+        "infer-schema",
+        help="Suggest a schema from a sample PDF",
+    )
+    inf.add_argument("pdf", help="PDF file to analyze")
+    inf.add_argument(
+        "--model", "-m", default=None,
+        help="Model ID (default: gpt-4.1-mini)",
+    )
+    inf.add_argument(
+        "--max-pages", type=int, default=2,
+        help="Pages to sample (default: 2)",
+    )
+    inf.add_argument(
+        "--parser", default="pymupdf",
+        choices=["pymupdf", "tables", "pdfplumber", "tabula"],
+        help="PDF text extraction backend",
+    )
+    inf.add_argument(
+        "--ocr", dest="ocr_backend", default="none",
+        choices=["none", "tesseract", "mistral"],
+        help="OCR backend for scanned pages",
+    )
+    inf.add_argument(
+        "--output", "-o", default=None,
+        help="Save schema to YAML file",
+    )
+    inf.add_argument(
+        "--llm-backend", "-b", default=None,
+        choices=["openai", "anthropic", "litellm"],
+        help="LLM backend override",
+    )
 
     args = parser.parse_args()
 
@@ -136,6 +182,8 @@ def main():
 
     if args.command == "extract":
         run_extract(args)
+    elif args.command == "infer-schema":
+        run_infer_schema(args)
 
 
 def run_extract(args):
@@ -266,8 +314,16 @@ def run_extract(args):
                     parser=parser,
                     ocr_backend=ocr_backend,
                     llm_backend=llm_backend,
-                    header_pages=spec.get("header_pages", 0),
-                    page_range=spec.get("pages") or None,
+                    header_pages=(
+                        args.header_pages
+                        if args.header_pages is not None
+                        else spec.get("header_pages", 0)
+                    ),
+                    page_range=(
+                        args.page_range
+                        or spec.get("pages")
+                        or None
+                    ),
                 )
             )
             all_results.extend(results)
@@ -340,6 +396,48 @@ def run_extract(args):
     print(
         f"Done. {len(all_records)} records from "
         f"{total} file{'s' if total > 1 else ''}.",
+        file=sys.stderr,
+    )
+
+
+def run_infer_schema(args):
+    model = (
+        args.model
+        or os.environ.get("PETEY_MODEL", "gpt-4.1-mini")
+    )
+    print(
+        f"Petey: analyzing {args.pdf} with {model} "
+        f"(sampling {args.max_pages} page(s))",
+        file=sys.stderr,
+    )
+
+    spec = infer_schema(
+        args.pdf,
+        model=model,
+        parser=args.parser,
+        ocr_backend=args.ocr_backend,
+        llm_backend=args.llm_backend,
+        max_pages=args.max_pages,
+    )
+
+    output = yaml.dump(
+        spec, default_flow_style=False, sort_keys=False,
+    )
+
+    if args.output:
+        Path(args.output).write_text(output)
+        print(
+            f"Schema saved to {args.output}",
+            file=sys.stderr,
+        )
+    else:
+        print(output)
+
+    n_fields = len(spec.get("fields", {}))
+    rtype = spec.get("record_type", "single")
+    print(
+        f"Suggested {n_fields} fields "
+        f"(record_type: {rtype})",
         file=sys.stderr,
     )
 
