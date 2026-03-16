@@ -170,6 +170,11 @@ def run_extract(args):
                 print(line)
 
     instructions = args.instructions or spec.get("instructions", "")
+    # Use "tables" parser by default for array schemas; allow explicit override
+    if args.parser != "pymupdf":
+        parser = args.parser
+    else:
+        parser = spec.get("parser", "tables" if is_array else "pymupdf")
 
     # Auto-chunk by page for array/table schemas unless explicitly disabled
     pages_per_chunk = args.pages_per_chunk
@@ -223,7 +228,7 @@ def run_extract(args):
                     pages_per_chunk=pages_per_chunk,
                     concurrency=args.concurrency,
                     on_result=on_chunk,
-                    parser=args.parser,
+                    parser=parser,
                     header_pages=spec.get("header_pages", 0),
                     page_range=spec.get("pages") or None,
                 )

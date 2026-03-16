@@ -42,13 +42,34 @@ def extract_text_pages(
     parser: str = "pymupdf",
     ocr_fallback: bool = False,
 ) -> list[str]:
-    """Extract text from each page of a PDF separately."""
+    """Extract text from each page of a PDF separately.
+
+    parser="tables" uses PyMuPDF table detection to preserve column alignment,
+    falling back to plain text for pages with no detected tables.
+    """
     doc = fitz.open(pdf_path)
     pages = []
     for page in doc:
-        text = page.get_text("text")
-        if ocr_fallback and len(text.strip()) < OCR_THRESHOLD:
-            text = _ocr_page(page)
+        if parser == "tables":
+            found = page.find_tables()
+            if found.tables:
+                parts = []
+                for table in found.tables:
+                    rows = table.extract()
+                    tsv = "\n".join(
+                        "\t".join(str(cell) if cell else "" for cell in row)
+                        for row in rows
+                        if any(cell for cell in row)
+                    )
+                    if tsv:
+                        parts.append(tsv)
+                text = "\n\n".join(parts) if parts else page.get_text("text")
+            else:
+                text = page.get_text("text")
+        else:
+            text = page.get_text("text")
+            if ocr_fallback and len(text.strip()) < OCR_THRESHOLD:
+                text = _ocr_page(page)
         pages.append(text)
     return pages
 
