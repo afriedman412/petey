@@ -169,6 +169,22 @@ def extract(
 
 # --- Page-chunked extraction ---
 
+def _parse_page_range(spec: str, total_pages: int) -> list[int]:
+    """Parse a page range string into sorted 0-indexed page indices.
+
+    Examples: "2-5" -> [1,2,3,4], "1,3,5-7" -> [0,2,4,5,6]
+    """
+    indices = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            indices.update(range(int(start) - 1, int(end)))
+        else:
+            indices.add(int(part) - 1)
+    return sorted(i for i in indices if 0 <= i < total_pages)
+
+
 async def extract_pages_async(
     pdf_path: str,
     response_model: type[BaseModel],
@@ -181,6 +197,7 @@ async def extract_pages_async(
     on_result=None,
     parser: str = "pymupdf",
     header_pages: int = 0,
+    page_range: str | None = None,
 ) -> list[dict]:
     """
     Split a PDF into page chunks and extract each concurrently.
@@ -192,19 +209,30 @@ async def extract_pages_async(
             chunk completes.
         header_pages: Number of leading pages to treat as a header. Their
             text is prepended to every chunk so the LLM has document context.
+        page_range: Optional page range string (e.g. "2-5" or "1,3,5-7").
+            1-indexed. If omitted, all non-header pages are processed.
 
     Returns list of result dicts (with _page and optionally _error).
     """
     pages = extract_text_pages(pdf_path, parser)
     header_text = "\n\n".join(pages[:header_pages]) if header_pages > 0 else ""
+
+    if page_range:
+        content_indices = [
+            i for i in _parse_page_range(page_range, len(pages))
+            if i >= header_pages
+        ]
+    else:
+        content_indices = list(range(header_pages, len(pages)))
+
     chunks = []
-    for i in range(header_pages, len(pages), pages_per_chunk):
-        chunk_pages = pages[i: i + pages_per_chunk]
-        text = "\n\n".join(chunk_pages)
+    for chunk_start in range(0, len(content_indices), pages_per_chunk):
+        idx_slice = content_indices[chunk_start: chunk_start + pages_per_chunk]
+        text = "\n\n".join(pages[i] for i in idx_slice)
         if header_text:
             text = header_text + "\n\n" + text
-        start = i + 1
-        end = min(i + pages_per_chunk, len(pages))
+        start = idx_slice[0] + 1
+        end = idx_slice[-1] + 1
         label = f"p{start}" if start == end else f"p{start}-{end}"
         chunks.append((label, text))
 

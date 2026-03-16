@@ -225,6 +225,7 @@ def run_extract(args):
                     on_result=on_chunk,
                     parser=args.parser,
                     header_pages=spec.get("header_pages", 0),
+                    page_range=spec.get("pages") or None,
                 )
             )
             all_results.extend(results)
