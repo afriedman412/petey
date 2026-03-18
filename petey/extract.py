@@ -43,7 +43,9 @@ def _extract_text_pages_pymupdf(pdf_path: str) -> list[str]:
     Produces structured markdown output with headers and table formatting,
     optimised for LLM consumption.
     """
-    chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
+    chunks = pymupdf4llm.to_markdown(
+        pdf_path, page_chunks=True, force_text=False,
+    )
     return [chunk["text"] for chunk in chunks]
 
 
@@ -652,6 +654,72 @@ def _parse_page_range(spec: str, total_pages: int) -> list[int]:
     return sorted(i for i in indices if 0 <= i < total_pages)
 
 
+def _parse_single_page(
+    pdf_path: str,
+    page_index: int,
+    parser: str,
+    ocr_backend: str = "none",
+) -> str:
+    """Extract text for a single page (0-indexed) using the given parser."""
+    if parser == "pymupdf":
+        chunks = pymupdf4llm.to_markdown(
+            pdf_path, pages=[page_index], page_chunks=True, force_text=False,
+        )
+        return chunks[0]["text"] if chunks else ""
+    elif parser == "tables":
+        doc = fitz.open(pdf_path)
+        page = doc[page_index]
+        found = page.find_tables()
+        if found.tables:
+            parts = []
+            for table in found.tables:
+                rows = table.extract()
+                tsv = "\n".join(
+                    "\t".join(str(cell) if cell else "" for cell in row)
+                    for row in rows
+                    if any(cell for cell in row)
+                )
+                if tsv:
+                    parts.append(tsv)
+            return "\n\n".join(parts) if parts else page.get_text("text")
+        return page.get_text("text")
+    elif parser == "pdfplumber":
+        try:
+            import pdfplumber
+        except ImportError:
+            raise ImportError(
+                "pdfplumber is required for parser='pdfplumber'. "
+                "Install it with: pip install pdfplumber"
+            )
+        with pdfplumber.open(pdf_path) as pdf:
+            page = pdf.pages[page_index]
+            return page.extract_text(layout=True) or page.extract_text() or ""
+    elif parser == "tabula":
+        try:
+            import tabula
+        except ImportError:
+            raise ImportError(
+                "tabula-py is required for parser='tabula'. "
+                "Install it with: pip install petey[tabula]"
+            )
+        try:
+            dfs = tabula.read_pdf(
+                pdf_path, pages=page_index + 1, multiple_tables=True,
+                silent=True,
+            )
+            if dfs:
+                parts = [df.to_csv(sep="\t", index=False).strip()
+                         for df in dfs if df.to_csv(sep="\t", index=False).strip()]
+                if parts:
+                    return "\n\n".join(parts)
+        except Exception:
+            pass
+        fallback = pymupdf4llm.to_markdown(pdf_path, pages=[page_index])
+        return fallback
+    else:
+        raise ValueError(f"Parser '{parser}' not found.")
+
+
 async def extract_pages_async(
     pdf_path: str,
     response_model: type[BaseModel],
@@ -662,13 +730,19 @@ async def extract_pages_async(
     pages_per_chunk: int = 1,
     concurrency: int = 10,
     on_result=None,
+    on_parse=None,
     parser: str = "pymupdf",
     ocr_backend: str = "none",
     llm_backend: str | None = None,
     header_pages: int = 0,
     page_range: str | None = None,
+    parse_multiplier: int = 5,
 ) -> list[dict]:
     """Split a PDF into page chunks and extract each concurrently.
+
+    Parsing and LLM extraction are pipelined: each page is parsed
+    individually and its LLM call is launched immediately, so parsing
+    page N and extracting page N-1 happen in parallel.
 
     Args:
         pdf_path: Path to the PDF file.
@@ -679,7 +753,9 @@ async def extract_pages_async(
         pages_per_chunk: Number of pages per chunk (default 1).
         concurrency: Max concurrent API calls.
         on_result: Optional callback(chunk_label, data_dict) called
-            as each chunk completes.
+            as each chunk's LLM extraction completes.
+        on_parse: Optional callback(chunk_label, total_chunks) called
+            as each chunk's text is parsed from the PDF.
         parser: Text extraction backend — see ``extract_text()``.
         ocr_backend: OCR backend — see ``extract_text()``.
         llm_backend: LLM backend — see ``_make_client()``.
@@ -692,47 +768,69 @@ async def extract_pages_async(
     Returns:
         List of result dicts (with _page and optionally _error).
     """
-    pages = extract_text_pages(pdf_path, parser, ocr_backend=ocr_backend)
-    # Table-oriented parsers strip non-table content, so header pages
-    # (which contain prose like name/status/filing info) need the default
-    # pymupdf parser to preserve that text.
-    if header_pages > 0 and parser != "pymupdf":
-        header_pages_text = extract_text_pages(
-            pdf_path, "pymupdf", ocr_backend=ocr_backend,
-        )[:header_pages]
-        header_text = "\n\n".join(header_pages_text)
-    elif header_pages > 0:
-        header_text = "\n\n".join(pages[:header_pages])
-    else:
-        header_text = ""
+    # Get page count without parsing everything
+    doc = fitz.open(pdf_path)
+    total_pages = len(doc)
+    doc.close()
+    print(f"[petey] {total_pages} pages, parser={parser}, page_range={page_range}", flush=True)
+
+    # Determine which parser to use for header pages
+    header_parser = "pymupdf" if (header_pages > 0 and parser != "pymupdf") else parser
+
+    # Parse header pages upfront (small, fast)
+    header_text = ""
+    if header_pages > 0:
+        header_parts = []
+        for i in range(min(header_pages, total_pages)):
+            header_parts.append(_parse_single_page(
+                pdf_path, i, header_parser, ocr_backend,
+            ))
+        header_text = "\n\n".join(header_parts)
+
+    # Determine content page indices
     if page_range:
         content_indices = [
-            i for i in _parse_page_range(page_range, len(pages))
+            i for i in _parse_page_range(page_range, total_pages)
             if i >= header_pages
         ]
     else:
-        content_indices = list(range(header_pages, len(pages)))
+        content_indices = list(range(header_pages, total_pages))
 
-    chunks = []
-    for chunk_start in range(
-        0, len(content_indices), pages_per_chunk
-    ):
-        idx_slice = content_indices[
-            chunk_start: chunk_start + pages_per_chunk
-        ]
-        text = "\n\n".join(pages[i] for i in idx_slice)
+    # Build chunk index groups (for pages_per_chunk > 1)
+    chunk_groups = []
+    for chunk_start in range(0, len(content_indices), pages_per_chunk):
+        chunk_groups.append(
+            content_indices[chunk_start: chunk_start + pages_per_chunk]
+        )
+
+    print(f"[petey] {len(chunk_groups)} chunks to process", flush=True)
+    sem = asyncio.Semaphore(concurrency)
+    parse_sem = asyncio.Semaphore(concurrency * parse_multiplier)
+    client = _make_client(model, api_key, llm_backend)
+    results = [None] * len(chunk_groups)
+    loop = asyncio.get_event_loop()
+
+    async def _parse_and_extract(idx: int, idx_slice: list[int]):
+        # Limit concurrent parsing so LLM calls can interleave
+        async with parse_sem:
+            print(f"[petey] chunk {idx}: parsing pages {idx_slice}", flush=True)
+            page_texts = await loop.run_in_executor(
+                None,
+                lambda: [
+                    _parse_single_page(pdf_path, i, parser, ocr_backend)
+                    for i in idx_slice
+                ],
+            )
+        text = "\n\n".join(page_texts)
         if header_text:
             text = header_text + "\n\n" + text
         start = idx_slice[0] + 1
         end = idx_slice[-1] + 1
         label = f"p{start}" if start == end else f"p{start}-{end}"
-        chunks.append((label, text))
+        print(f"[petey] chunk {idx} ({label}): parsed, sending to LLM", flush=True)
+        if on_parse:
+            on_parse(label, len(chunk_groups))
 
-    sem = asyncio.Semaphore(concurrency)
-    client = _make_client(model, api_key, llm_backend)
-    results = [None] * len(chunks)
-
-    async def _process(idx: int, label: str, text: str):
         async with sem:
             try:
                 result = await client.chat.completions.create(
@@ -752,8 +850,8 @@ async def extract_pages_async(
 
     await asyncio.gather(
         *[
-            _process(i, label, text)
-            for i, (label, text) in enumerate(chunks)
+            _parse_and_extract(i, idx_slice)
+            for i, idx_slice in enumerate(chunk_groups)
         ]
     )
     return results
