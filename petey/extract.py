@@ -14,6 +14,7 @@ Each layer is swappable via parameters on the public functions.
 """
 import asyncio
 import base64
+import concurrent.futures
 import os
 import warnings
 
@@ -809,18 +810,19 @@ async def extract_pages_async(
     client = _make_client(model, api_key, llm_backend)
     results = [None] * len(chunk_groups)
     loop = asyncio.get_event_loop()
+    pool = concurrent.futures.ProcessPoolExecutor(max_workers=min(len(chunk_groups), os.cpu_count() or 4))
 
     async def _parse_and_extract(idx: int, idx_slice: list[int]):
         # Limit concurrent parsing so LLM calls can interleave
         async with parse_sem:
             print(f"[petey] chunk {idx}: parsing pages {idx_slice}", flush=True)
-            page_texts = await loop.run_in_executor(
-                None,
-                lambda: [
-                    _parse_single_page(pdf_path, i, parser, ocr_backend)
-                    for i in idx_slice
-                ],
-            )
+            futs = [
+                loop.run_in_executor(
+                    pool, _parse_single_page, pdf_path, i, parser, ocr_backend,
+                )
+                for i in idx_slice
+            ]
+            page_texts = await asyncio.gather(*futs)
         text = "\n\n".join(page_texts)
         if header_text:
             text = header_text + "\n\n" + text
@@ -854,6 +856,7 @@ async def extract_pages_async(
             for i, idx_slice in enumerate(chunk_groups)
         ]
     )
+    pool.shutdown(wait=False)
     return results
 
 
