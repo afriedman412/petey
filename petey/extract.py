@@ -44,10 +44,17 @@ def _extract_text_pages_pymupdf(pdf_path: str) -> list[str]:
     Produces structured markdown output with headers and table formatting,
     optimised for LLM consumption.
     """
-    chunks = pymupdf4llm.to_markdown(
-        pdf_path, page_chunks=True, force_text=False,
-    )
-    return [chunk["text"] for chunk in chunks]
+    try:
+        chunks = pymupdf4llm.to_markdown(
+            pdf_path, page_chunks=True, force_text=False,
+        )
+        return [chunk["text"] for chunk in chunks]
+    except Exception:
+        # Ghostscript or other pymupdf4llm failure — fall back to plain text
+        doc = fitz.open(pdf_path)
+        pages = [page.get_text("text") for page in doc]
+        doc.close()
+        return pages
 
 
 def _extract_text_pages_tables(pdf_path: str) -> list[str]:
@@ -290,12 +297,59 @@ def _ocr_page_mistral(page) -> str:
     return "\n\n".join(parts) if parts else ""
 
 
+def _ocr_page_surya(page) -> str:
+    """OCR a single fitz page using Datalab's Surya OCR API.
+
+    Renders the page to a PNG, submits to Datalab's convert endpoint,
+    polls for completion, and returns the markdown text.
+
+    Requires ``DATALAB_API_KEY`` environment variable or will raise
+    ``ValueError``.
+    """
+    import requests as _requests
+    import time as _time
+
+    api_key = os.environ.get("DATALAB_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "Surya OCR requires DATALAB_API_KEY environment variable."
+        )
+
+    pix = page.get_pixmap(dpi=200)
+    img_bytes = pix.tobytes("png")
+
+    # Submit to Datalab convert API
+    resp = _requests.post(
+        "https://www.datalab.to/api/v1/convert",
+        files={"file": ("page.png", img_bytes, "image/png")},
+        data={"output_format": "markdown"},
+        headers={"X-API-Key": api_key},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    check_url = data.get("request_check_url")
+    if not check_url:
+        raise ValueError("Datalab API did not return a check URL")
+
+    # Poll for completion
+    headers = {"X-API-Key": api_key}
+    for _ in range(120):  # up to ~4 minutes
+        _time.sleep(2)
+        r = _requests.get(check_url, headers=headers)
+        r.raise_for_status()
+        result = r.json()
+        if result.get("status") == "complete":
+            return result.get("markdown", "")
+    raise TimeoutError("Datalab OCR timed out after 4 minutes")
+
+
 # --- OCR backend registry ---
 # Each backend is a callable: (page: fitz.Page) -> str
 
 OCR_BACKENDS = {
     "tesseract": _ocr_page_tesseract,
     "mistral": _ocr_page_mistral,
+    "surya": _ocr_page_surya,
 }
 
 
@@ -491,14 +545,30 @@ async def extract_async(
             stacklevel=2,
         )
     client = _make_client(model, api_key, llm_backend)
-    return await client.chat.completions.create(
-        model=model,
-        response_model=response_model,
-        max_retries=2,
-        messages=_make_messages(text, instructions),
-        temperature=0,
-        max_tokens=4096,
-    )
+    for attempt in range(5):
+        try:
+            return await client.chat.completions.create(
+                model=model,
+                response_model=response_model,
+                max_retries=2,
+                messages=_make_messages(text, instructions),
+                temperature=0,
+                max_tokens=4096,
+            )
+        except Exception as e:
+            err_str = str(e)
+            is_rate_limit = (
+                "429" in err_str
+                or "rate" in err_str.lower()
+                or "quota" in err_str.lower()
+                or "capacity" in err_str.lower()
+            )
+            if is_rate_limit and attempt < 4:
+                wait = 2 ** attempt + 1
+                print(f"[petey] rate limited, retrying in {wait}s (attempt {attempt + 1}/5)", flush=True)
+                await asyncio.sleep(wait)
+                continue
+            raise
 
 
 def extract(
@@ -663,10 +733,17 @@ def _parse_single_page(
 ) -> str:
     """Extract text for a single page (0-indexed) using the given parser."""
     if parser == "pymupdf":
-        chunks = pymupdf4llm.to_markdown(
-            pdf_path, pages=[page_index], page_chunks=True, force_text=False,
-        )
-        return chunks[0]["text"] if chunks else ""
+        try:
+            chunks = pymupdf4llm.to_markdown(
+                pdf_path, pages=[page_index], page_chunks=True, force_text=False,
+            )
+            return chunks[0]["text"] if chunks else ""
+        except Exception:
+            # Ghostscript rasterizing or other pymupdf4llm failure — fall back
+            doc = fitz.open(pdf_path)
+            text = doc[page_index].get_text("text")
+            doc.close()
+            return text
     elif parser == "tables":
         doc = fitz.open(pdf_path)
         page = doc[page_index]
@@ -834,18 +911,34 @@ async def extract_pages_async(
             on_parse(label, len(chunk_groups))
 
         async with sem:
-            try:
-                result = await client.chat.completions.create(
-                    model=model,
-                    response_model=response_model,
-                    max_retries=2,
-                    messages=_make_messages(text, instructions),
-                    temperature=0,
-                )
-                data = result.model_dump()
-                data["_page"] = label
-            except Exception as e:
-                data = {"_page": label, "_error": str(e)}
+            data = None
+            for attempt in range(5):
+                try:
+                    result = await client.chat.completions.create(
+                        model=model,
+                        response_model=response_model,
+                        max_retries=2,
+                        messages=_make_messages(text, instructions),
+                        temperature=0,
+                    )
+                    data = result.model_dump()
+                    data["_page"] = label
+                    break
+                except Exception as e:
+                    err_str = str(e)
+                    is_rate_limit = (
+                        "429" in err_str
+                        or "rate" in err_str.lower()
+                        or "quota" in err_str.lower()
+                        or "capacity" in err_str.lower()
+                    )
+                    if is_rate_limit and attempt < 4:
+                        wait = 2 ** attempt + 1
+                        print(f"[petey] {label}: rate limited, retrying in {wait}s (attempt {attempt + 1}/5)", flush=True)
+                        await asyncio.sleep(wait)
+                        continue
+                    data = {"_page": label, "_error": err_str}
+                    break
             results[idx] = data
             if on_result:
                 on_result(label, data)
