@@ -383,6 +383,22 @@ def _ocr_full(doc, pdf_path: str, ocr_backend: str) -> str:
     )
 
 
+def _ocr_full_doc(pdf_path: str) -> str:
+    """OCR all pages of a PDF using tesseract."""
+    doc = fitz.open(pdf_path)
+    pages = [_ocr_page_tesseract(page) for page in doc]
+    doc.close()
+    return "\n\n".join(pages)
+
+
+def _ocr_single_page(pdf_path: str, page_index: int) -> str:
+    """OCR a single page by index. Picklable for ProcessPoolExecutor."""
+    doc = fitz.open(pdf_path)
+    text = _ocr_page_tesseract(doc[page_index])
+    doc.close()
+    return text
+
+
 async def _extract_text_async(
     pdf_path: str,
     parser: str = "pymupdf",
@@ -545,6 +561,7 @@ async def extract_async(
             stacklevel=2,
         )
     client = _make_client(model, api_key, llm_backend)
+    ocr_retried = False
     for attempt in range(5):
         try:
             return await client.chat.completions.create(
@@ -568,6 +585,17 @@ async def extract_async(
                 print(f"[petey] rate limited, retrying in {wait}s (attempt {attempt + 1}/5)", flush=True)
                 await asyncio.sleep(wait)
                 continue
+            # On non-rate-limit failure, retry with OCR if we haven't already
+            if not ocr_retried and pdf_path:
+                ocr_retried = True
+                print(f"[petey] extraction failed, retrying with OCR fallback", flush=True)
+                try:
+                    ocr_text = _ocr_full_doc(pdf_path)
+                    if ocr_text and len(ocr_text.strip()) > 50:
+                        text = ocr_text
+                        continue
+                except Exception:
+                    pass
             raise
 
 
@@ -874,6 +902,11 @@ async def extract_pages_async(
     else:
         content_indices = list(range(header_pages, total_pages))
 
+    # If all pages are headers (e.g. 1-page PDF with header_pages=1),
+    # treat header pages as content too so they still get extracted
+    if not content_indices and total_pages > 0:
+        content_indices = list(range(total_pages))
+
     # Build chunk index groups (for pages_per_chunk > 1)
     chunk_groups = []
     for chunk_start in range(0, len(content_indices), pages_per_chunk):
@@ -887,7 +920,10 @@ async def extract_pages_async(
     client = _make_client(model, api_key, llm_backend)
     results = [None] * len(chunk_groups)
     loop = asyncio.get_event_loop()
-    pool = concurrent.futures.ProcessPoolExecutor(max_workers=min(len(chunk_groups), os.cpu_count() or 4))
+    if not chunk_groups:
+        print(f"[petey] no content pages to process (header_pages={header_pages}, total={total_pages})", flush=True)
+        return []
+    pool = concurrent.futures.ProcessPoolExecutor(max_workers=max(1, min(len(chunk_groups), os.cpu_count() or 4)))
 
     async def _parse_and_extract(idx: int, idx_slice: list[int]):
         # Limit concurrent parsing so LLM calls can interleave
@@ -912,6 +948,7 @@ async def extract_pages_async(
 
         async with sem:
             data = None
+            ocr_retried = False
             for attempt in range(5):
                 try:
                     result = await client.chat.completions.create(
@@ -937,6 +974,24 @@ async def extract_pages_async(
                         print(f"[petey] {label}: rate limited, retrying in {wait}s (attempt {attempt + 1}/5)", flush=True)
                         await asyncio.sleep(wait)
                         continue
+                    # On non-rate-limit failure, retry with OCR
+                    if not ocr_retried:
+                        ocr_retried = True
+                        print(f"[petey] {label}: extraction failed ({err_str[:80]}), retrying with OCR", flush=True)
+                        try:
+                            futs = [
+                                loop.run_in_executor(
+                                    pool, _ocr_single_page, pdf_path, i,
+                                )
+                                for i in idx_slice
+                            ]
+                            ocr_pages = await asyncio.gather(*futs)
+                            ocr_text = "\n\n".join(ocr_pages)
+                            if ocr_text and len(ocr_text.strip()) > 50:
+                                text = (header_text + "\n\n" + ocr_text) if header_text else ocr_text
+                                continue
+                        except Exception as ocr_err:
+                            print(f"[petey] {label}: OCR fallback also failed: {ocr_err}", flush=True)
                     data = {"_page": label, "_error": err_str}
                     break
             results[idx] = data
@@ -950,7 +1005,30 @@ async def extract_pages_async(
         ]
     )
     pool.shutdown(wait=False)
-    return results
+
+    # Deduplicate results, keeping first occurrence per unique row
+    seen = set()
+    deduped = []
+    dupes = 0
+    for r in results:
+        if r is None or r.get("_error"):
+            deduped.append(r)
+            continue
+        # Build key from all fields except _page and _error
+        key_fields = tuple(
+            sorted(
+                (k, str(v)) for k, v in r.items()
+                if k not in ("_page", "_error")
+            )
+        )
+        if key_fields in seen:
+            dupes += 1
+            continue
+        seen.add(key_fields)
+        deduped.append(r)
+    if dupes:
+        print(f"[petey] deduplicated {dupes} duplicate rows ({len(results)} -> {len(deduped)})", flush=True)
+    return deduped
 
 
 # --- Batch extraction ---
