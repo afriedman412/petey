@@ -529,6 +529,7 @@ async def extract_async(
     ocr_backend: str = "none",
     llm_backend: str | None = None,
     text: str | None = None,
+    parse_fn=None,
 ) -> BaseModel:
     """Extract structured data from a single PDF.
 
@@ -544,15 +545,20 @@ async def extract_async(
         ocr_backend: OCR backend — see ``extract_text()``.
         llm_backend: LLM backend — see ``_make_client()``.
         text: Pre-extracted text (skips PDF parsing if provided).
+        parse_fn: Optional async callable(pdf_path, parser, ocr_backend)
+            -> str. When provided, replaces local text extraction.
 
     Returns:
         Populated Pydantic model instance.
     """
     if text is None:
-        text = await _extract_text_async(
-            pdf_path, parser,
-            ocr_fallback=ocr_fallback, ocr_backend=ocr_backend,
-        )
+        if parse_fn is not None:
+            text = await parse_fn(pdf_path, parser, ocr_backend)
+        else:
+            text = await _extract_text_async(
+                pdf_path, parser,
+                ocr_fallback=ocr_fallback, ocr_backend=ocr_backend,
+            )
     if len(text) > TEXT_WARN_THRESHOLD:
         warnings.warn(
             f"Document is large ({len(text):,} chars). "
@@ -843,6 +849,7 @@ async def extract_pages_async(
     header_pages: int = 0,
     page_range: str | None = None,
     parse_multiplier: int = 5,
+    parse_fn=None,
 ) -> list[dict]:
     """Split a PDF into page chunks and extract each concurrently.
 
@@ -870,6 +877,9 @@ async def extract_pages_async(
         page_range: Optional page range string (e.g. "2-5" or
             "1,3,5-7"). 1-indexed. If omitted, all non-header
             pages are processed.
+        parse_fn: Optional async callable(pdf_path, page_index, parser,
+            ocr_backend) -> str. When provided, replaces local
+            page-level text extraction (no ProcessPoolExecutor used).
 
     Returns:
         List of result dicts (with _page and optionally _error).
@@ -888,9 +898,15 @@ async def extract_pages_async(
     if header_pages > 0:
         header_parts = []
         for i in range(min(header_pages, total_pages)):
-            header_parts.append(_parse_single_page(
-                pdf_path, i, header_parser, ocr_backend,
-            ))
+            if parse_fn is not None:
+                header_parts.append(
+                    await parse_fn(pdf_path, i, header_parser,
+                                   ocr_backend)
+                )
+            else:
+                header_parts.append(_parse_single_page(
+                    pdf_path, i, header_parser, ocr_backend,
+                ))
         header_text = "\n\n".join(header_parts)
 
     # Determine content page indices
@@ -914,28 +930,50 @@ async def extract_pages_async(
             content_indices[chunk_start: chunk_start + pages_per_chunk]
         )
 
-    print(f"[petey] {len(chunk_groups)} chunks to process", flush=True)
+    print(f"[petey] {len(chunk_groups)} chunks to process",
+          flush=True)
     sem = asyncio.Semaphore(concurrency)
     parse_sem = asyncio.Semaphore(concurrency * parse_multiplier)
     client = _make_client(model, api_key, llm_backend)
     results = [None] * len(chunk_groups)
-    loop = asyncio.get_event_loop()
     if not chunk_groups:
-        print(f"[petey] no content pages to process (header_pages={header_pages}, total={total_pages})", flush=True)
+        print(
+            f"[petey] no content pages to process "
+            f"(header_pages={header_pages}, total={total_pages})",
+            flush=True,
+        )
         return []
-    pool = concurrent.futures.ProcessPoolExecutor(max_workers=max(1, min(len(chunk_groups), os.cpu_count() or 4)))
+
+    # Only create process pool when using local parsing
+    pool = None
+    loop = None
+    if parse_fn is None:
+        loop = asyncio.get_event_loop()
+        pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=max(
+                1, min(len(chunk_groups), os.cpu_count() or 4)
+            )
+        )
 
     async def _parse_and_extract(idx: int, idx_slice: list[int]):
         # Limit concurrent parsing so LLM calls can interleave
         async with parse_sem:
-            print(f"[petey] chunk {idx}: parsing pages {idx_slice}", flush=True)
-            futs = [
-                loop.run_in_executor(
-                    pool, _parse_single_page, pdf_path, i, parser, ocr_backend,
-                )
-                for i in idx_slice
-            ]
-            page_texts = await asyncio.gather(*futs)
+            print(f"[petey] chunk {idx}: parsing pages "
+                  f"{idx_slice}", flush=True)
+            if parse_fn is not None:
+                page_texts = await asyncio.gather(*[
+                    parse_fn(pdf_path, i, parser, ocr_backend)
+                    for i in idx_slice
+                ])
+            else:
+                futs = [
+                    loop.run_in_executor(
+                        pool, _parse_single_page,
+                        pdf_path, i, parser, ocr_backend,
+                    )
+                    for i in idx_slice
+                ]
+                page_texts = await asyncio.gather(*futs)
         text = "\n\n".join(page_texts)
         if header_text:
             text = header_text + "\n\n" + text
@@ -975,23 +1013,46 @@ async def extract_pages_async(
                         await asyncio.sleep(wait)
                         continue
                     # On non-rate-limit failure, retry with OCR
-                    if not ocr_retried:
+                    # (only when using local parsing; remote
+                    # parse_fn handles OCR internally)
+                    if (not ocr_retried
+                            and parse_fn is None):
                         ocr_retried = True
-                        print(f"[petey] {label}: extraction failed ({err_str[:80]}), retrying with OCR", flush=True)
+                        print(
+                            f"[petey] {label}: extraction "
+                            f"failed ({err_str[:80]}), "
+                            f"retrying with OCR",
+                            flush=True,
+                        )
                         try:
                             futs = [
                                 loop.run_in_executor(
-                                    pool, _ocr_single_page, pdf_path, i,
+                                    pool,
+                                    _ocr_single_page,
+                                    pdf_path, i,
                                 )
                                 for i in idx_slice
                             ]
-                            ocr_pages = await asyncio.gather(*futs)
+                            ocr_pages = await asyncio.gather(
+                                *futs
+                            )
                             ocr_text = "\n\n".join(ocr_pages)
-                            if ocr_text and len(ocr_text.strip()) > 50:
-                                text = (header_text + "\n\n" + ocr_text) if header_text else ocr_text
+                            if (ocr_text
+                                    and len(ocr_text.strip()) > 50):
+                                text = (
+                                    (header_text + "\n\n"
+                                     + ocr_text)
+                                    if header_text
+                                    else ocr_text
+                                )
                                 continue
                         except Exception as ocr_err:
-                            print(f"[petey] {label}: OCR fallback also failed: {ocr_err}", flush=True)
+                            print(
+                                f"[petey] {label}: OCR "
+                                f"fallback also failed: "
+                                f"{ocr_err}",
+                                flush=True,
+                            )
                     data = {"_page": label, "_error": err_str}
                     break
             results[idx] = data
@@ -1004,7 +1065,8 @@ async def extract_pages_async(
             for i, idx_slice in enumerate(chunk_groups)
         ]
     )
-    pool.shutdown(wait=False)
+    if pool is not None:
+        pool.shutdown(wait=False)
 
     # Deduplicate results, keeping first occurrence per unique row
     seen = set()
@@ -1046,6 +1108,7 @@ async def extract_batch(
     ocr_fallback: bool = False,
     ocr_backend: str = "none",
     llm_backend: str | None = None,
+    parse_fn=None,
 ) -> list[dict]:
     """Extract from multiple PDFs concurrently.
 
@@ -1062,6 +1125,9 @@ async def extract_batch(
         ocr_fallback: Deprecated. Use ``ocr_backend`` instead.
         ocr_backend: OCR backend — see ``extract_text()``.
         llm_backend: LLM backend — see ``_make_client()``.
+        parse_fn: Optional async callable(pdf_path, parser,
+            ocr_backend) -> str. When provided, replaces local
+            text extraction.
 
     Returns:
         List of result dicts (with _source_file and optionally
@@ -1074,11 +1140,16 @@ async def extract_batch(
     async def _process(path: str):
         async with sem:
             try:
-                text = await _extract_text_async(
-                    path, parser,
-                    ocr_fallback=ocr_fallback,
-                    ocr_backend=ocr_backend,
-                )
+                if parse_fn is not None:
+                    text = await parse_fn(
+                        path, parser, ocr_backend,
+                    )
+                else:
+                    text = await _extract_text_async(
+                        path, parser,
+                        ocr_fallback=ocr_fallback,
+                        ocr_backend=ocr_backend,
+                    )
                 result = await client.chat.completions.create(
                     model=model,
                     response_model=response_model,
