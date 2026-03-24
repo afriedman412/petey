@@ -5,8 +5,8 @@ Configure via environment variables or pass explicitly.
 Pipeline architecture::
 
     PDF
-     └─ TextExtractor      (pymupdf | pdfplumber | tabula)
-          └─ OCRBackend    (tesseract | mistral | none)
+     └─ TextExtractor      (pymupdf | pdfplumber | tabula | marker)
+          └─ OCRBackend    (tesseract | mistral | surya | chandra | none)
                └─ LLMBackend  (openai | anthropic | litellm)
                     └─ Output  (csv | json | jsonl)
 
@@ -15,8 +15,16 @@ Each layer is swappable via parameters on the public functions.
 import asyncio
 import base64
 import concurrent.futures
+from functools import partial
+import json
 import os
+import time as _time
 import warnings
+
+try:
+    import requests as _requests
+except ImportError:  # pragma: no cover
+    _requests = None  # type: ignore[assignment]
 
 import fitz
 import pymupdf4llm
@@ -157,14 +165,179 @@ def _extract_text_pages_tabula(pdf_path: str) -> list[str]:
     return pages
 
 
+# --- Remote API backend infrastructure ---
+#
+# Any HTTP service that accepts a file and returns text can be wired in
+# as a parser or OCR backend by adding config to API_PARSERS / API_OCR_BACKENDS.
+# No new functions needed — just a dict.
+#
+# Config keys:
+#   endpoint       — URL to POST the file to (required)
+#   api_key_env    — env var name for the API key (required)
+#   auth_header    — HTTP header name (default: "X-API-Key")
+#   auth_prefix    — prepended to key value, e.g. "Bearer" (default: "")
+#   request_format — how to send the file (default: "multipart")
+#       "multipart"  — standard multipart/form-data file upload
+#       "json_b64"   — base64-encoded file in a JSON body
+#   file_field     — field name for the file in the request (default: "file")
+#   params         — extra form data / JSON fields to include (default: {})
+#   response_key   — dot-path into JSON response for the text (default: "markdown")
+#   poll           — whether to poll a check URL for async results (default: True)
+#   poll_status_key — key to check for completion (default: "status")
+#   poll_done_value — value that means done (default: "complete")
+#   poll_check_key  — key containing the poll URL (default: "request_check_url")
+#   timeout        — max seconds to wait for poll (default: 240)
+
+API_PARSERS: dict[str, dict] = {
+    "marker": {
+        "endpoint": "https://www.datalab.to/api/v1/marker",
+        "api_key_env": "DATALAB_API_KEY",
+        "auth_header": "X-API-Key",
+        "params": {"output_format": "markdown"},
+        "response_key": "markdown",
+        "poll": True,
+    },
+}
+
+API_OCR_BACKENDS: dict[str, dict] = {
+    "surya": {
+        "endpoint": "https://www.datalab.to/api/v1/convert",
+        "api_key_env": "DATALAB_API_KEY",
+        "auth_header": "X-API-Key",
+        "params": {"output_format": "markdown"},
+        "response_key": "markdown",
+        "poll": True,
+    },
+    "chandra": {
+        "endpoint": "https://www.datalab.to/api/v1/chandra",
+        "api_key_env": "DATALAB_API_KEY",
+        "auth_header": "X-API-Key",
+        "params": {"output_format": "markdown"},
+        "response_key": "markdown",
+        "poll": True,
+    },
+}
+
+
+def _resolve_response(data: dict, key_path: str) -> str:
+    """Extract a value from a nested dict using a dot-separated path.
+
+    ``"markdown"`` → ``data["markdown"]``
+    ``"result.text"`` → ``data["result"]["text"]``
+    """
+    obj = data
+    for part in key_path.split("."):
+        if isinstance(obj, dict):
+            obj = obj.get(part, "")
+        else:
+            return ""
+    return str(obj) if obj else ""
+
+
+def _build_auth_header(cfg: dict, api_key: str) -> dict:
+    """Build the auth header dict from config."""
+    header_name = cfg.get("auth_header", "X-API-Key")
+    prefix = cfg.get("auth_prefix", "")
+    value = f"{prefix} {api_key}".strip() if prefix else api_key
+    return {header_name: value}
+
+
+def _api_post(cfg: dict, file_bytes: bytes, filename: str,
+              content_type: str) -> str:
+    """POST a file to a remote API and return the extracted text.
+
+    Handles both multipart upload and JSON+base64 request formats,
+    sync and async (poll-based) responses.
+    """
+    api_key = _api_get_key(cfg)
+    headers = _build_auth_header(cfg, api_key)
+    endpoint = cfg["endpoint"]
+    params = cfg.get("params", {})
+    request_format = cfg.get("request_format", "multipart")
+    file_field = cfg.get("file_field", "file")
+
+    if request_format == "json_b64":
+        payload = {
+            file_field: base64.b64encode(file_bytes).decode(),
+            "filename": filename,
+            **params,
+        }
+        headers["Content-Type"] = "application/json"
+        resp = _requests.post(
+            endpoint, data=json.dumps(payload), headers=headers)
+    else:  # multipart (default)
+        resp = _requests.post(
+            endpoint,
+            files={file_field: (filename, file_bytes, content_type)},
+            data=params,
+            headers=headers,
+        )
+
+    resp.raise_for_status()
+    result = resp.json()
+
+    response_key = cfg.get("response_key", "markdown")
+
+    if cfg.get("poll", True):
+        check_key = cfg.get("poll_check_key", "request_check_url")
+        status_key = cfg.get("poll_status_key", "status")
+        done_value = cfg.get("poll_done_value", "complete")
+        timeout = cfg.get("timeout", 240)
+        poll_interval = 2
+
+        check_url = result.get(check_key)
+        if not check_url:
+            raise ValueError(
+                f"API at {endpoint} did not return '{check_key}'")
+        poll_headers = _build_auth_header(cfg, api_key)
+        for _ in range(timeout // poll_interval):
+            _time.sleep(poll_interval)
+            r = _requests.get(check_url, headers=poll_headers)
+            r.raise_for_status()
+            result = r.json()
+            if result.get(status_key) == done_value:
+                return _resolve_response(result, response_key)
+        raise TimeoutError(
+            f"API at {endpoint} timed out after {timeout}s")
+
+    return _resolve_response(result, response_key)
+
+
+def _api_get_key(cfg: dict) -> str:
+    """Resolve the API key from the environment for a backend config."""
+    env_var = cfg["api_key_env"]
+    api_key = os.environ.get(env_var)
+    if not api_key:
+        raise ValueError(f"{env_var} environment variable is required.")
+    return api_key
+
+
+def _parse_pdf_via_api(pdf_path: str, cfg: dict) -> list[str]:
+    """Parse a full PDF by uploading it to a remote API."""
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+    text = _api_post(cfg, pdf_bytes, "document.pdf", "application/pdf")
+    return [text] if text else [""]
+
+
+def _ocr_page_via_api(page, cfg: dict) -> str:
+    """OCR a single fitz page by uploading it to a remote API."""
+    pix = page.get_pixmap(dpi=200)
+    img_bytes = pix.tobytes("png")
+    return _api_post(cfg, img_bytes, "page.png", "image/png")
+
+
 # --- Parser registry ---
 # Each parser is a callable: (pdf_path: str) -> list[str]
+# Local parsers are plain functions; API parsers are built from config.
 
 PARSERS = {
     "pymupdf": _extract_text_pages_pymupdf,
     "tables": _extract_text_pages_tables,
     "pdfplumber": _extract_text_pages_pdfplumber,
     "tabula": _extract_text_pages_tabula,
+    **{name: partial(_parse_pdf_via_api, cfg=cfg)
+       for name, cfg in API_PARSERS.items()},
 }
 
 
@@ -297,59 +470,15 @@ def _ocr_page_mistral(page) -> str:
     return "\n\n".join(parts) if parts else ""
 
 
-def _ocr_page_surya(page) -> str:
-    """OCR a single fitz page using Datalab's Surya OCR API.
-
-    Renders the page to a PNG, submits to Datalab's convert endpoint,
-    polls for completion, and returns the markdown text.
-
-    Requires ``DATALAB_API_KEY`` environment variable or will raise
-    ``ValueError``.
-    """
-    import requests as _requests
-    import time as _time
-
-    api_key = os.environ.get("DATALAB_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "Surya OCR requires DATALAB_API_KEY environment variable."
-        )
-
-    pix = page.get_pixmap(dpi=200)
-    img_bytes = pix.tobytes("png")
-
-    # Submit to Datalab convert API
-    resp = _requests.post(
-        "https://www.datalab.to/api/v1/convert",
-        files={"file": ("page.png", img_bytes, "image/png")},
-        data={"output_format": "markdown"},
-        headers={"X-API-Key": api_key},
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    check_url = data.get("request_check_url")
-    if not check_url:
-        raise ValueError("Datalab API did not return a check URL")
-
-    # Poll for completion
-    headers = {"X-API-Key": api_key}
-    for _ in range(120):  # up to ~4 minutes
-        _time.sleep(2)
-        r = _requests.get(check_url, headers=headers)
-        r.raise_for_status()
-        result = r.json()
-        if result.get("status") == "complete":
-            return result.get("markdown", "")
-    raise TimeoutError("Datalab OCR timed out after 4 minutes")
-
-
 # --- OCR backend registry ---
 # Each backend is a callable: (page: fitz.Page) -> str
+# Local backends are plain functions; API backends are built from config.
 
 OCR_BACKENDS = {
     "tesseract": _ocr_page_tesseract,
     "mistral": _ocr_page_mistral,
-    "surya": _ocr_page_surya,
+    **{name: partial(_ocr_page_via_api, cfg=cfg)
+       for name, cfg in API_OCR_BACKENDS.items()},
 }
 
 
@@ -442,33 +571,80 @@ def _get_provider(model: str, llm_backend: str | None = None) -> str:
     return "openai"
 
 
-def _make_client_openai(api_key: str | None = None):
+def _make_client_openai(api_key: str | None = None, **kwargs):
     """Build an instructor-wrapped OpenAI async client."""
-    key = api_key or os.environ.get("OPENAI_API_KEY")
-    return instructor.from_openai(AsyncOpenAI(api_key=key))
+    base_url = kwargs.get("base_url")
+    key = api_key or os.environ.get(
+        kwargs.get("api_key_env", "OPENAI_API_KEY"))
+    client_kwargs = {"api_key": key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    return instructor.from_openai(AsyncOpenAI(**client_kwargs))
 
 
-def _make_client_anthropic(api_key: str | None = None):
+def _make_client_anthropic(api_key: str | None = None, **kwargs):
     """Build an instructor-wrapped Anthropic async client."""
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    key = api_key or os.environ.get(
+        kwargs.get("api_key_env", "ANTHROPIC_API_KEY"))
     return instructor.from_anthropic(
         AsyncAnthropic(api_key=key), max_tokens=16384,
     )
 
 
-def _make_client_litellm(api_key: str | None = None):
+def _make_client_litellm(api_key: str | None = None, **kwargs):
     """Build an instructor-wrapped litellm client."""
     from litellm import acompletion
     return instructor.from_litellm(acompletion)
 
 
 # --- LLM backend registry ---
-# Each backend is a callable: (api_key: str | None) -> instructor client
+#
+# Each backend is a callable: (api_key: str | None, **kwargs) -> instructor client
+#
+# Built-in backends handle OpenAI, Anthropic, and litellm (100+ providers).
+# Any OpenAI-compatible API (vLLM, Ollama, Together, etc.) can be used by
+# setting llm_backend="openai" and passing base_url / api_key_env via
+# API_LLM_BACKENDS config.
+#
+# To add a new provider that speaks the OpenAI protocol:
+#
+#   API_LLM_BACKENDS["myhost"] = {
+#       "client": "openai",
+#       "base_url": "https://my-host.com/v1",
+#       "api_key_env": "MYHOST_API_KEY",
+#   }
 
-LLM_BACKENDS = {
+_LLM_CLIENT_BUILDERS = {
     "openai": _make_client_openai,
     "anthropic": _make_client_anthropic,
     "litellm": _make_client_litellm,
+}
+
+API_LLM_BACKENDS: dict[str, dict] = {
+    # Example:
+    # "myhost": {
+    #     "client": "openai",          # which builder to use
+    #     "base_url": "https://...",    # OpenAI-compatible endpoint
+    #     "api_key_env": "MYHOST_KEY", # env var for the key
+    # },
+}
+
+
+def _make_api_llm_client(api_key: str | None = None, **cfg):
+    """Build an LLM client from API_LLM_BACKENDS config."""
+    builder_name = cfg.get("client", "openai")
+    builder = _LLM_CLIENT_BUILDERS.get(builder_name)
+    if builder is None:
+        raise ValueError(
+            f"Unknown LLM client type '{builder_name}'. "
+            f"Available: {', '.join(_LLM_CLIENT_BUILDERS)}")
+    return builder(api_key, **cfg)
+
+
+LLM_BACKENDS = {
+    **_LLM_CLIENT_BUILDERS,
+    **{name: partial(_make_api_llm_client, **cfg)
+       for name, cfg in API_LLM_BACKENDS.items()},
 }
 
 

@@ -2,6 +2,7 @@
 Tests for the petey package.
 Tests text extraction and schema building using MCI page 1 as test data.
 """
+import json
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -508,3 +509,455 @@ class TestParsers:
                 str(MCI_PDF), parser="pymupdf", ocr_backend="none",
             )
             mock_p4l.to_markdown.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Remote API backend infrastructure
+# ---------------------------------------------------------------------------
+
+class TestResolveResponse:
+    """Test dot-path response key extraction."""
+
+    def test_simple_key(self):
+        from petey.extract import _resolve_response
+        assert _resolve_response({"markdown": "hello"}, "markdown") == "hello"
+
+    def test_nested_key(self):
+        from petey.extract import _resolve_response
+        data = {"result": {"text": "found it"}}
+        assert _resolve_response(data, "result.text") == "found it"
+
+    def test_missing_key_returns_empty(self):
+        from petey.extract import _resolve_response
+        assert _resolve_response({"a": 1}, "missing") == ""
+
+    def test_missing_nested_returns_empty(self):
+        from petey.extract import _resolve_response
+        assert _resolve_response({"a": {"b": 1}}, "a.c") == ""
+
+    def test_deep_nesting(self):
+        from petey.extract import _resolve_response
+        data = {"a": {"b": {"c": "deep"}}}
+        assert _resolve_response(data, "a.b.c") == "deep"
+
+    def test_none_value_returns_empty(self):
+        from petey.extract import _resolve_response
+        assert _resolve_response({"key": None}, "key") == ""
+
+
+class TestBuildAuthHeader:
+    """Test auth header construction from config."""
+
+    def test_raw_key(self):
+        from petey.extract import _build_auth_header
+        cfg = {"auth_header": "X-API-Key"}
+        assert _build_auth_header(cfg, "mykey") == {"X-API-Key": "mykey"}
+
+    def test_bearer_prefix(self):
+        from petey.extract import _build_auth_header
+        cfg = {"auth_header": "Authorization", "auth_prefix": "Bearer"}
+        assert _build_auth_header(cfg, "tok") == {
+            "Authorization": "Bearer tok"}
+
+    def test_defaults(self):
+        from petey.extract import _build_auth_header
+        assert _build_auth_header({}, "k") == {"X-API-Key": "k"}
+
+
+class TestApiGetKey:
+    """Test env var resolution for API keys."""
+
+    def test_key_found(self):
+        from petey.extract import _api_get_key
+        with patch.dict(os.environ, {"MY_KEY": "secret"}):
+            assert _api_get_key({"api_key_env": "MY_KEY"}) == "secret"
+
+    def test_key_missing(self):
+        from petey.extract import _api_get_key
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(ValueError, match="MY_KEY"):
+                _api_get_key({"api_key_env": "MY_KEY"})
+
+
+class TestApiPost:
+    """Test the generic _api_post function with mocked HTTP."""
+
+    def _make_cfg(self, **overrides):
+        cfg = {
+            "endpoint": "https://example.com/api",
+            "api_key_env": "TEST_KEY",
+            "auth_header": "X-API-Key",
+            "response_key": "text",
+            "poll": False,
+            "params": {},
+        }
+        cfg.update(overrides)
+        return cfg
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_multipart_no_poll(self):
+        from petey.extract import _api_post
+        cfg = self._make_cfg()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"text": "extracted"}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("petey.extract._requests.post",
+                    return_value=mock_resp) as mock_post:
+            result = _api_post(cfg, b"file bytes", "doc.pdf",
+                               "application/pdf")
+
+        assert result == "extracted"
+        mock_post.assert_called_once()
+        _, kwargs = mock_post.call_args
+        assert kwargs["files"]["file"][0] == "doc.pdf"
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_json_b64_no_poll(self):
+        from petey.extract import _api_post
+        import base64
+        cfg = self._make_cfg(request_format="json_b64")
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"text": "from b64"}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("petey.extract._requests.post",
+                    return_value=mock_resp) as mock_post:
+            result = _api_post(cfg, b"raw", "f.png", "image/png")
+
+        assert result == "from b64"
+        _, kwargs = mock_post.call_args
+        body = json.loads(kwargs["data"])
+        assert body["file"] == base64.b64encode(b"raw").decode()
+        assert body["filename"] == "f.png"
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_poll_flow(self):
+        from petey.extract import _api_post
+        cfg = self._make_cfg(poll=True, response_key="markdown",
+                             timeout=10)
+        # First POST returns check URL
+        submit_resp = MagicMock()
+        submit_resp.json.return_value = {
+            "request_check_url": "https://example.com/check/123"}
+        submit_resp.raise_for_status = MagicMock()
+        # First poll: not done, second poll: done
+        poll_pending = MagicMock()
+        poll_pending.json.return_value = {"status": "pending"}
+        poll_pending.raise_for_status = MagicMock()
+        poll_done = MagicMock()
+        poll_done.json.return_value = {
+            "status": "complete", "markdown": "result text"}
+        poll_done.raise_for_status = MagicMock()
+
+        with patch("petey.extract._requests.post",
+                    return_value=submit_resp):
+            with patch("petey.extract._requests.get",
+                        side_effect=[poll_pending, poll_done]):
+                with patch("petey.extract._time.sleep"):
+                    result = _api_post(
+                        cfg, b"data", "f.pdf", "application/pdf")
+
+        assert result == "result text"
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_poll_timeout(self):
+        from petey.extract import _api_post
+        cfg = self._make_cfg(poll=True, timeout=4)
+        submit_resp = MagicMock()
+        submit_resp.json.return_value = {
+            "request_check_url": "https://example.com/check/1"}
+        submit_resp.raise_for_status = MagicMock()
+        poll_resp = MagicMock()
+        poll_resp.json.return_value = {"status": "pending"}
+        poll_resp.raise_for_status = MagicMock()
+
+        with patch("petey.extract._requests.post",
+                    return_value=submit_resp):
+            with patch("petey.extract._requests.get",
+                        return_value=poll_resp):
+                with patch("petey.extract._time.sleep"):
+                    with pytest.raises(TimeoutError):
+                        _api_post(cfg, b"x", "f.pdf", "application/pdf")
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_missing_check_url(self):
+        from petey.extract import _api_post
+        cfg = self._make_cfg(poll=True)
+        resp = MagicMock()
+        resp.json.return_value = {}  # no check URL
+        resp.raise_for_status = MagicMock()
+
+        with patch("petey.extract._requests.post", return_value=resp):
+            with pytest.raises(ValueError, match="check"):
+                _api_post(cfg, b"x", "f.pdf", "application/pdf")
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_bearer_auth(self):
+        from petey.extract import _api_post
+        cfg = self._make_cfg(
+            auth_header="Authorization", auth_prefix="Bearer",
+            poll=False)
+        resp = MagicMock()
+        resp.json.return_value = {"text": "ok"}
+        resp.raise_for_status = MagicMock()
+
+        with patch("petey.extract._requests.post",
+                    return_value=resp) as mock_post:
+            _api_post(cfg, b"x", "f.pdf", "application/pdf")
+
+        _, kwargs = mock_post.call_args
+        assert kwargs["headers"]["Authorization"] == "Bearer k"
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_custom_poll_keys(self):
+        from petey.extract import _api_post
+        cfg = self._make_cfg(
+            poll=True, timeout=10,
+            poll_check_key="job_url",
+            poll_status_key="state",
+            poll_done_value="finished",
+            response_key="output.text",
+        )
+        submit_resp = MagicMock()
+        submit_resp.json.return_value = {
+            "job_url": "https://example.com/job/1"}
+        submit_resp.raise_for_status = MagicMock()
+        poll_done = MagicMock()
+        poll_done.json.return_value = {
+            "state": "finished",
+            "output": {"text": "custom result"},
+        }
+        poll_done.raise_for_status = MagicMock()
+
+        with patch("petey.extract._requests.post",
+                    return_value=submit_resp):
+            with patch("petey.extract._requests.get",
+                        return_value=poll_done):
+                with patch("petey.extract._time.sleep"):
+                    result = _api_post(
+                        cfg, b"x", "f.pdf", "application/pdf")
+
+        assert result == "custom result"
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_extra_params(self):
+        from petey.extract import _api_post
+        cfg = self._make_cfg(
+            params={"output_format": "html", "lang": "en"},
+            poll=False)
+        resp = MagicMock()
+        resp.json.return_value = {"text": "ok"}
+        resp.raise_for_status = MagicMock()
+
+        with patch("petey.extract._requests.post",
+                    return_value=resp) as mock_post:
+            _api_post(cfg, b"x", "f.pdf", "application/pdf")
+
+        _, kwargs = mock_post.call_args
+        assert kwargs["data"]["output_format"] == "html"
+        assert kwargs["data"]["lang"] == "en"
+
+
+class TestParsePdfViaApi:
+    """Test the parser wrapper around _api_post."""
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_returns_list(self, tmp_path):
+        from petey.extract import _parse_pdf_via_api
+        pdf = tmp_path / "test.pdf"
+        pdf.write_bytes(b"fake pdf")
+        cfg = {
+            "endpoint": "https://example.com/api",
+            "api_key_env": "TEST_KEY",
+            "poll": False,
+            "response_key": "text",
+        }
+        with patch("petey.extract._api_post", return_value="parsed"):
+            result = _parse_pdf_via_api(str(pdf), cfg)
+        assert result == ["parsed"]
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_empty_result(self, tmp_path):
+        from petey.extract import _parse_pdf_via_api
+        pdf = tmp_path / "test.pdf"
+        pdf.write_bytes(b"fake pdf")
+        cfg = {
+            "endpoint": "https://example.com/api",
+            "api_key_env": "TEST_KEY",
+            "poll": False,
+            "response_key": "text",
+        }
+        with patch("petey.extract._api_post", return_value=""):
+            result = _parse_pdf_via_api(str(pdf), cfg)
+        assert result == [""]
+
+
+class TestOcrPageViaApi:
+    """Test the OCR wrapper around _api_post."""
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_renders_and_posts(self):
+        from petey.extract import _ocr_page_via_api
+        mock_page = MagicMock()
+        mock_pix = MagicMock()
+        mock_pix.tobytes.return_value = b"png bytes"
+        mock_page.get_pixmap.return_value = mock_pix
+        cfg = {
+            "endpoint": "https://example.com/ocr",
+            "api_key_env": "TEST_KEY",
+            "poll": False,
+            "response_key": "text",
+        }
+        with patch("petey.extract._api_post",
+                    return_value="ocr text") as mock_post:
+            result = _ocr_page_via_api(mock_page, cfg)
+
+        assert result == "ocr text"
+        mock_page.get_pixmap.assert_called_once_with(dpi=200)
+        args, _ = mock_post.call_args
+        # args: (cfg, file_bytes, filename, content_type)
+        assert args[1] == b"png bytes"
+        assert args[2] == "page.png"
+        assert args[3] == "image/png"
+
+
+# ---------------------------------------------------------------------------
+# Registry wiring
+# ---------------------------------------------------------------------------
+
+class TestRegistries:
+    """Verify all expected backends appear in the registries."""
+
+    def test_parser_registry_has_local_backends(self):
+        from petey.extract import PARSERS
+        for name in ["pymupdf", "pdfplumber", "tables", "tabula"]:
+            assert name in PARSERS, f"Missing parser: {name}"
+
+    def test_parser_registry_has_api_backends(self):
+        from petey.extract import PARSERS
+        assert "marker" in PARSERS
+
+    def test_ocr_registry_has_local_backends(self):
+        from petey.extract import OCR_BACKENDS
+        for name in ["tesseract", "mistral"]:
+            assert name in OCR_BACKENDS, f"Missing OCR: {name}"
+
+    def test_ocr_registry_has_api_backends(self):
+        from petey.extract import OCR_BACKENDS
+        for name in ["surya", "chandra"]:
+            assert name in OCR_BACKENDS, f"Missing OCR: {name}"
+
+    def test_llm_registry_has_builtins(self):
+        from petey.extract import LLM_BACKENDS
+        for name in ["openai", "anthropic", "litellm"]:
+            assert name in LLM_BACKENDS, f"Missing LLM: {name}"
+
+    def test_api_parsers_config_valid(self):
+        from petey.extract import API_PARSERS
+        for name, cfg in API_PARSERS.items():
+            assert "endpoint" in cfg, f"{name} missing endpoint"
+            assert "api_key_env" in cfg, f"{name} missing api_key_env"
+
+    def test_api_ocr_config_valid(self):
+        from petey.extract import API_OCR_BACKENDS
+        for name, cfg in API_OCR_BACKENDS.items():
+            assert "endpoint" in cfg, f"{name} missing endpoint"
+            assert "api_key_env" in cfg, f"{name} missing api_key_env"
+
+    def test_api_parsers_are_callable(self):
+        from petey.extract import PARSERS
+        for name in ["marker"]:
+            assert callable(PARSERS[name])
+
+    def test_api_ocr_are_callable(self):
+        from petey.extract import OCR_BACKENDS
+        for name in ["surya", "chandra"]:
+            assert callable(OCR_BACKENDS[name])
+
+    def test_marker_uses_correct_endpoint(self):
+        from petey.extract import API_PARSERS
+        assert "marker" in API_PARSERS
+        assert "/marker" in API_PARSERS["marker"]["endpoint"]
+
+    def test_surya_uses_correct_endpoint(self):
+        from petey.extract import API_OCR_BACKENDS
+        assert "/convert" in API_OCR_BACKENDS["surya"]["endpoint"]
+
+    def test_chandra_uses_correct_endpoint(self):
+        from petey.extract import API_OCR_BACKENDS
+        assert "/chandra" in API_OCR_BACKENDS["chandra"]["endpoint"]
+
+
+class TestLLMBackendConfig:
+    """Test config-driven LLM backend registration."""
+
+    def test_api_llm_backend_creates_openai_client(self):
+        from petey.extract import _make_api_llm_client
+        with patch.dict(os.environ, {"TEST_LLM_KEY": "k"}):
+            with patch("petey.extract.AsyncOpenAI") as mock_oai:
+                with patch("petey.extract.instructor") as mock_inst:
+                    mock_inst.from_openai.return_value = "client"
+                    result = _make_api_llm_client(
+                        client="openai",
+                        api_key_env="TEST_LLM_KEY",
+                        base_url="https://my-host.com/v1",
+                    )
+        assert result == "client"
+        mock_oai.assert_called_once_with(
+            api_key="k", base_url="https://my-host.com/v1")
+
+    def test_api_llm_backend_unknown_client_type(self):
+        from petey.extract import _make_api_llm_client
+        with pytest.raises(ValueError, match="Unknown LLM client"):
+            _make_api_llm_client(client="buttllm")
+
+
+# ---------------------------------------------------------------------------
+# Integration: API parser/OCR via extract_text
+# ---------------------------------------------------------------------------
+
+class TestApiIntegration:
+    """Test that API backends integrate with extract_text/extract_text_pages."""
+
+    @patch.dict(os.environ, {"DATALAB_API_KEY": "test-key"})
+    def test_marker_parser_via_extract_text(self, tmp_path):
+        pdf = tmp_path / "test.pdf"
+        pdf.write_bytes(b"fake pdf")
+        with patch("petey.extract._api_post",
+                    return_value="marker output") as mock:
+            text = extract_text(str(pdf), parser="marker")
+        assert text == "marker output"
+
+    @patch.dict(os.environ, {"DATALAB_API_KEY": "test-key"})
+    def test_chandra_ocr_via_extract_text(self, tmp_path):
+        import fitz
+        doc = fitz.open()
+        doc.new_page()
+        blank_pdf = tmp_path / "blank.pdf"
+        doc.save(str(blank_pdf))
+
+        with patch("petey.extract._api_post",
+                    return_value="chandra ocr") as mock:
+            text = extract_text(
+                str(blank_pdf), parser="pdfplumber",
+                ocr_backend="chandra")
+        assert "chandra ocr" in text
+
+    def test_unknown_parser_raises(self, tmp_path):
+        pdf = tmp_path / "test.pdf"
+        pdf.write_bytes(b"fake pdf")
+        with pytest.raises(ValueError, match="not found"):
+            extract_text(str(pdf), parser="buttparse")
+
+    def test_unknown_ocr_raises(self, tmp_path):
+        import fitz
+        doc = fitz.open()
+        doc.new_page()
+        blank_pdf = tmp_path / "blank.pdf"
+        doc.save(str(blank_pdf))
+
+        with pytest.raises(ValueError, match="not found"):
+            extract_text(
+                str(blank_pdf), parser="pdfplumber",
+                ocr_backend="buttocr")
