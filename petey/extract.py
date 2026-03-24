@@ -6,7 +6,7 @@ Pipeline architecture::
 
     PDF
      └─ TextExtractor      (pymupdf | pdfplumber | tabula | marker)
-          └─ OCRBackend    (tesseract | mistral | surya | chandra | none)
+          └─ OCRBackend    (tesseract | mistral | chandra | none)
                └─ LLMBackend  (openai | anthropic | litellm)
                     └─ Output  (csv | json | jsonl)
 
@@ -200,14 +200,6 @@ API_PARSERS: dict[str, dict] = {
 }
 
 API_OCR_BACKENDS: dict[str, dict] = {
-    "surya": {
-        "endpoint": "https://www.datalab.to/api/v1/convert",
-        "api_key_env": "DATALAB_API_KEY",
-        "auth_header": "X-API-Key",
-        "params": {"output_format": "markdown"},
-        "response_key": "markdown",
-        "poll": True,
-    },
     "chandra": {
         "endpoint": "https://www.datalab.to/api/v1/chandra",
         "api_key_env": "DATALAB_API_KEY",

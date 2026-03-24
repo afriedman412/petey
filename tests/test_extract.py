@@ -845,8 +845,7 @@ class TestRegistries:
 
     def test_ocr_registry_has_api_backends(self):
         from petey.extract import OCR_BACKENDS
-        for name in ["surya", "chandra"]:
-            assert name in OCR_BACKENDS, f"Missing OCR: {name}"
+        assert "chandra" in OCR_BACKENDS
 
     def test_llm_registry_has_builtins(self):
         from petey.extract import LLM_BACKENDS
@@ -872,17 +871,12 @@ class TestRegistries:
 
     def test_api_ocr_are_callable(self):
         from petey.extract import OCR_BACKENDS
-        for name in ["surya", "chandra"]:
-            assert callable(OCR_BACKENDS[name])
+        assert callable(OCR_BACKENDS["chandra"])
 
     def test_marker_uses_correct_endpoint(self):
         from petey.extract import API_PARSERS
         assert "marker" in API_PARSERS
         assert "/marker" in API_PARSERS["marker"]["endpoint"]
-
-    def test_surya_uses_correct_endpoint(self):
-        from petey.extract import API_OCR_BACKENDS
-        assert "/convert" in API_OCR_BACKENDS["surya"]["endpoint"]
 
     def test_chandra_uses_correct_endpoint(self):
         from petey.extract import API_OCR_BACKENDS
