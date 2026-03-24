@@ -14,17 +14,14 @@ Each layer is swappable via parameters on the public functions.
 """
 import asyncio
 import base64
-import concurrent.futures
+from petey.concurrency import get_manager
 from functools import partial
 import json
 import os
-import time as _time
+import tempfile
 import warnings
 
-try:
-    import requests as _requests
-except ImportError:  # pragma: no cover
-    _requests = None  # type: ignore[assignment]
+import httpx
 
 import fitz
 import pymupdf4llm
@@ -234,8 +231,12 @@ def _build_auth_header(cfg: dict, api_key: str) -> dict:
     return {header_name: value}
 
 
-def _api_post(cfg: dict, file_bytes: bytes, filename: str,
-              content_type: str) -> str:
+async def _api_post(
+    cfg: dict,
+    file_bytes: bytes,
+    filename: str,
+    content_type: str,
+) -> str:
     """POST a file to a remote API and return the extracted text.
 
     Handles both multipart upload and JSON+base64 request formats,
@@ -248,51 +249,72 @@ def _api_post(cfg: dict, file_bytes: bytes, filename: str,
     request_format = cfg.get("request_format", "multipart")
     file_field = cfg.get("file_field", "file")
 
-    if request_format == "json_b64":
-        payload = {
-            file_field: base64.b64encode(file_bytes).decode(),
-            "filename": filename,
-            **params,
-        }
-        headers["Content-Type"] = "application/json"
-        resp = _requests.post(
-            endpoint, data=json.dumps(payload), headers=headers)
-    else:  # multipart (default)
-        resp = _requests.post(
-            endpoint,
-            files={file_field: (filename, file_bytes, content_type)},
-            data=params,
-            headers=headers,
-        )
+    async with httpx.AsyncClient(timeout=60) as client:
+        if request_format == "json_b64":
+            payload = {
+                file_field: base64.b64encode(
+                    file_bytes
+                ).decode(),
+                "filename": filename,
+                **params,
+            }
+            headers["Content-Type"] = "application/json"
+            resp = await client.post(
+                endpoint,
+                content=json.dumps(payload),
+                headers=headers,
+            )
+        else:  # multipart (default)
+            resp = await client.post(
+                endpoint,
+                files={
+                    file_field: (
+                        filename, file_bytes, content_type,
+                    ),
+                },
+                data=params,
+                headers=headers,
+            )
 
-    resp.raise_for_status()
-    result = resp.json()
+        resp.raise_for_status()
+        result = resp.json()
 
-    response_key = cfg.get("response_key", "markdown")
+        response_key = cfg.get("response_key", "markdown")
 
-    if cfg.get("poll", True):
-        check_key = cfg.get("poll_check_key", "request_check_url")
-        status_key = cfg.get("poll_status_key", "status")
-        done_value = cfg.get("poll_done_value", "complete")
-        timeout = cfg.get("timeout", 240)
-        poll_interval = 2
+        if cfg.get("poll", True):
+            check_key = cfg.get(
+                "poll_check_key", "request_check_url",
+            )
+            status_key = cfg.get("poll_status_key", "status")
+            done_value = cfg.get(
+                "poll_done_value", "complete",
+            )
+            timeout = cfg.get("timeout", 240)
+            poll_interval = 2
+            check_url = result.get(check_key)
+            if not check_url:
+                raise ValueError(
+                    f"API at {endpoint} "
+                    f"did not return '{check_key}'"
+                )
+            poll_headers = _build_auth_header(cfg, api_key)
+            for _ in range(timeout // poll_interval):
+                await asyncio.sleep(poll_interval)
+                r = await client.get(
+                    check_url, headers=poll_headers,
+                )
+                r.raise_for_status()
+                result = r.json()
+                if result.get(status_key) == done_value:
+                    return _resolve_response(
+                        result, response_key,
+                    )
+            raise TimeoutError(
+                f"API at {endpoint} "
+                f"timed out after {timeout}s"
+            )
 
-        check_url = result.get(check_key)
-        if not check_url:
-            raise ValueError(
-                f"API at {endpoint} did not return '{check_key}'")
-        poll_headers = _build_auth_header(cfg, api_key)
-        for _ in range(timeout // poll_interval):
-            _time.sleep(poll_interval)
-            r = _requests.get(check_url, headers=poll_headers)
-            r.raise_for_status()
-            result = r.json()
-            if result.get(status_key) == done_value:
-                return _resolve_response(result, response_key)
-        raise TimeoutError(
-            f"API at {endpoint} timed out after {timeout}s")
-
-    return _resolve_response(result, response_key)
+        return _resolve_response(result, response_key)
 
 
 def _api_get_key(cfg: dict) -> str:
@@ -304,19 +326,23 @@ def _api_get_key(cfg: dict) -> str:
     return api_key
 
 
-def _parse_pdf_via_api(pdf_path: str, cfg: dict) -> list[str]:
+async def _parse_pdf_via_api(pdf_path: str, cfg: dict) -> list[str]:
     """Parse a full PDF by uploading it to a remote API."""
     with open(pdf_path, "rb") as f:
         pdf_bytes = f.read()
-    text = _api_post(cfg, pdf_bytes, "document.pdf", "application/pdf")
+    text = await _api_post(
+        cfg, pdf_bytes, "document.pdf", "application/pdf",
+    )
     return [text] if text else [""]
 
 
-def _ocr_page_via_api(page, cfg: dict) -> str:
+async def _ocr_page_via_api(page, cfg: dict) -> str:
     """OCR a single fitz page by uploading it to a remote API."""
     pix = page.get_pixmap(dpi=200)
     img_bytes = pix.tobytes("png")
-    return _api_post(cfg, img_bytes, "page.png", "image/png")
+    return await _api_post(
+        cfg, img_bytes, "page.png", "image/png",
+    )
 
 
 # --- Parser registry ---
@@ -393,7 +419,20 @@ def extract_text_pages(
     # (pymupdf4llm runs its own built-in OCR which can't be fully disabled).
     if parser == "pymupdf" and ocr_backend != "none":
         fn = PARSERS["pdfplumber"]
-    pages = fn(pdf_path)
+    if asyncio.iscoroutinefunction(fn):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            raise RuntimeError(
+                f"Parser '{parser}' is async. Use "
+                f"extract_async() or "
+                f"extract_pages_async() instead."
+            )
+        pages = asyncio.run(fn(pdf_path))
+    else:
+        pages = fn(pdf_path)
 
     # Apply OCR fallback to pages with insufficient text
     if ocr_backend != "none":
@@ -492,8 +531,20 @@ def _ocr_page(
     if fn is None:
         raise ValueError(
             f"OCR backend '{ocr_backend}' not found. "
-            f"Available backends: {', '.join(OCR_BACKENDS)}"
+            f"Available: {', '.join(OCR_BACKENDS)}"
         )
+    if asyncio.iscoroutinefunction(fn):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            raise RuntimeError(
+                f"OCR backend '{ocr_backend}' is async. "
+                f"Use extract_async() or "
+                f"extract_pages_async() instead."
+            )
+        return asyncio.run(fn(page))
     return fn(page)
 
 
@@ -518,19 +569,6 @@ def _ocr_single_page(pdf_path: str, page_index: int) -> str:
     text = _ocr_page_tesseract(doc[page_index])
     doc.close()
     return text
-
-
-async def _extract_text_async(
-    pdf_path: str,
-    parser: str = "pymupdf",
-    ocr_fallback: bool = False,
-    ocr_backend: str = "none",
-) -> str:
-    return extract_text(
-        pdf_path, parser,
-        ocr_fallback=ocr_fallback, ocr_backend=ocr_backend,
-    )
-
 
 # --- LLM client ---
 
@@ -719,14 +757,28 @@ async def extract_async(
     Returns:
         Populated Pydantic model instance.
     """
+    mgr = get_manager()
     if text is None:
         if parse_fn is not None:
-            text = await parse_fn(pdf_path, parser, ocr_backend)
-        else:
-            text = await _extract_text_async(
-                pdf_path, parser,
-                ocr_fallback=ocr_fallback, ocr_backend=ocr_backend,
+            text = await mgr.run(
+                parse_fn, pdf_path, parser, ocr_backend,
             )
+        else:
+            # Look up the parser to dispatch correctly:
+            # async (API) → mgr.run, sync (local) → mgr.run_cpu
+            parser_fn = PARSERS.get(parser)
+            if parser_fn and asyncio.iscoroutinefunction(
+                parser_fn
+            ):
+                pages = await mgr.run(
+                    parser_fn, pdf_path,
+                )
+                text = "\n\n".join(pages)
+            else:
+                text = await mgr.run_cpu(
+                    extract_text, pdf_path, parser,
+                    ocr_fallback, ocr_backend,
+                )
     if len(text) > TEXT_WARN_THRESHOLD:
         warnings.warn(
             f"Document is large ({len(text):,} chars). "
@@ -738,14 +790,17 @@ async def extract_async(
     ocr_retried = False
     for attempt in range(5):
         try:
-            return await client.chat.completions.create(
-                model=model,
-                response_model=response_model,
-                max_retries=2,
-                messages=_make_messages(text, instructions),
-                temperature=0,
-                max_tokens=4096,
-            )
+            async with mgr.api():
+                return await client.chat.completions.create(
+                    model=model,
+                    response_model=response_model,
+                    max_retries=2,
+                    messages=_make_messages(
+                        text, instructions,
+                    ),
+                    temperature=0,
+                    max_tokens=4096,
+                )
         except Exception as e:
             err_str = str(e)
             is_rate_limit = (
@@ -756,16 +811,27 @@ async def extract_async(
             )
             if is_rate_limit and attempt < 4:
                 wait = 2 ** attempt + 1
-                print(f"[petey] rate limited, retrying in {wait}s (attempt {attempt + 1}/5)", flush=True)
+                print(
+                    f"[petey] rate limited, retrying "
+                    f"in {wait}s "
+                    f"(attempt {attempt + 1}/5)",
+                    flush=True,
+                )
                 await asyncio.sleep(wait)
                 continue
-            # On non-rate-limit failure, retry with OCR if we haven't already
             if not ocr_retried and pdf_path:
                 ocr_retried = True
-                print(f"[petey] extraction failed, retrying with OCR fallback", flush=True)
+                print(
+                    "[petey] extraction failed, "
+                    "retrying with OCR fallback",
+                    flush=True,
+                )
                 try:
-                    ocr_text = _ocr_full_doc(pdf_path)
-                    if ocr_text and len(ocr_text.strip()) > 50:
+                    ocr_text = await mgr.run_cpu(
+                        _ocr_full_doc, pdf_path,
+                    )
+                    if (ocr_text
+                            and len(ocr_text.strip()) > 50):
                         text = ocr_text
                         continue
                 except Exception:
@@ -927,77 +993,30 @@ def _parse_page_range(spec: str, total_pages: int) -> list[int]:
     return sorted(i for i in indices if 0 <= i < total_pages)
 
 
-def _parse_single_page(
-    pdf_path: str,
-    page_index: int,
-    parser: str,
-    ocr_backend: str = "none",
-) -> str:
-    """Extract text for a single page (0-indexed) using the given parser."""
-    if parser == "pymupdf":
-        try:
-            chunks = pymupdf4llm.to_markdown(
-                pdf_path, pages=[page_index], page_chunks=True, force_text=False,
-            )
-            return chunks[0]["text"] if chunks else ""
-        except Exception:
-            # Ghostscript rasterizing or other pymupdf4llm failure — fall back
-            doc = fitz.open(pdf_path)
-            text = doc[page_index].get_text("text")
-            doc.close()
-            return text
-    elif parser == "tables":
-        doc = fitz.open(pdf_path)
-        page = doc[page_index]
-        found = page.find_tables()
-        if found.tables:
-            parts = []
-            for table in found.tables:
-                rows = table.extract()
-                tsv = "\n".join(
-                    "\t".join(str(cell) if cell else "" for cell in row)
-                    for row in rows
-                    if any(cell for cell in row)
-                )
-                if tsv:
-                    parts.append(tsv)
-            return "\n\n".join(parts) if parts else page.get_text("text")
-        return page.get_text("text")
-    elif parser == "pdfplumber":
-        try:
-            import pdfplumber
-        except ImportError:
-            raise ImportError(
-                "pdfplumber is required for parser='pdfplumber'. "
-                "Install it with: pip install pdfplumber"
-            )
-        with pdfplumber.open(pdf_path) as pdf:
-            page = pdf.pages[page_index]
-            return page.extract_text(layout=True) or page.extract_text() or ""
-    elif parser == "tabula":
-        try:
-            import tabula
-        except ImportError:
-            raise ImportError(
-                "tabula-py is required for parser='tabula'. "
-                "Install it with: pip install petey[tabula]"
-            )
-        try:
-            dfs = tabula.read_pdf(
-                pdf_path, pages=page_index + 1, multiple_tables=True,
-                silent=True,
-            )
-            if dfs:
-                parts = [df.to_csv(sep="\t", index=False).strip()
-                         for df in dfs if df.to_csv(sep="\t", index=False).strip()]
-                if parts:
-                    return "\n\n".join(parts)
-        except Exception:
-            pass
-        fallback = pymupdf4llm.to_markdown(pdf_path, pages=[page_index])
-        return fallback
-    else:
-        raise ValueError(f"Parser '{parser}' not found.")
+def _subset_pdf(pdf_path: str, page_indices: list[int]) -> str:
+    """Create a temporary PDF containing only the given pages.
+
+    Args:
+        pdf_path: Path to the source PDF.
+        page_indices: 0-indexed page numbers to include.
+
+    Returns:
+        Path to a temporary PDF file. Caller is responsible
+        for cleanup.
+    """
+    doc = fitz.open(pdf_path)
+    subset = fitz.open()
+    for i in page_indices:
+        subset.insert_pdf(doc, from_page=i, to_page=i)
+    doc.close()
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=".pdf", delete=False,
+    )
+    subset.save(tmp.name)
+    subset.close()
+    tmp.close()
+    return tmp.name
+
 
 
 async def extract_pages_async(
@@ -1052,117 +1071,156 @@ async def extract_pages_async(
     Returns:
         List of result dicts (with _page and optionally _error).
     """
+    if parse_multiplier != 5:
+        warnings.warn(
+            "parse_multiplier is deprecated and ignored. "
+            "CPU and API concurrency are now managed "
+            "separately by ConcurrencyManager.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    # Resolve parser from registry
+    parser_fn = PARSERS.get(parser)
+    if parser_fn is None:
+        raise ValueError(
+            f"Parser '{parser}' not found. "
+            f"Available: {', '.join(PARSERS)}"
+        )
+    parser_is_async = asyncio.iscoroutinefunction(
+        parser_fn
+    )
+
     # Get page count without parsing everything
     doc = fitz.open(pdf_path)
     total_pages = len(doc)
     doc.close()
-    print(f"[petey] {total_pages} pages, parser={parser}, page_range={page_range}", flush=True)
+    print(
+        f"[petey] {total_pages} pages, "
+        f"parser={parser}, "
+        f"page_range={page_range}",
+        flush=True,
+    )
 
-    # Determine which parser to use for header pages
-    header_parser = "pymupdf" if (header_pages > 0 and parser != "pymupdf") else parser
+    mgr = get_manager()
+    mgr.configure(api_limit=concurrency)
 
     # Parse header pages upfront (small, fast)
     header_text = ""
     if header_pages > 0:
-        header_parts = []
-        for i in range(min(header_pages, total_pages)):
-            if parse_fn is not None:
-                header_parts.append(
-                    await parse_fn(pdf_path, i, header_parser,
-                                   ocr_backend)
+        h_indices = list(
+            range(min(header_pages, total_pages))
+        )
+        h_path = _subset_pdf(pdf_path, h_indices)
+        try:
+            if parser_is_async:
+                h_pages = await mgr.run(
+                    parser_fn, h_path,
                 )
             else:
-                header_parts.append(_parse_single_page(
-                    pdf_path, i, header_parser, ocr_backend,
-                ))
-        header_text = "\n\n".join(header_parts)
+                h_pages = await mgr.run_cpu(
+                    parser_fn, h_path,
+                )
+            header_text = "\n\n".join(h_pages)
+        finally:
+            os.unlink(h_path)
 
     # Determine content page indices
     if page_range:
         content_indices = [
-            i for i in _parse_page_range(page_range, total_pages)
+            i for i in _parse_page_range(
+                page_range, total_pages,
+            )
             if i >= header_pages
         ]
     else:
-        content_indices = list(range(header_pages, total_pages))
+        content_indices = list(
+            range(header_pages, total_pages)
+        )
 
-    # If all pages are headers (e.g. 1-page PDF with header_pages=1),
-    # treat header pages as content too so they still get extracted
+    # If all pages are headers (e.g. 1-page PDF with
+    # header_pages=1), treat header pages as content too
     if not content_indices and total_pages > 0:
         content_indices = list(range(total_pages))
 
     # Build chunk index groups (for pages_per_chunk > 1)
     chunk_groups = []
-    for chunk_start in range(0, len(content_indices), pages_per_chunk):
+    for chunk_start in range(
+        0, len(content_indices), pages_per_chunk,
+    ):
         chunk_groups.append(
-            content_indices[chunk_start: chunk_start + pages_per_chunk]
+            content_indices[
+                chunk_start:chunk_start + pages_per_chunk
+            ]
         )
 
-    print(f"[petey] {len(chunk_groups)} chunks to process",
-          flush=True)
-    sem = asyncio.Semaphore(concurrency)
-    parse_sem = asyncio.Semaphore(concurrency * parse_multiplier)
+    print(
+        f"[petey] {len(chunk_groups)} chunks to process",
+        flush=True,
+    )
     client = _make_client(model, api_key, llm_backend)
     results = [None] * len(chunk_groups)
     if not chunk_groups:
         print(
             f"[petey] no content pages to process "
-            f"(header_pages={header_pages}, total={total_pages})",
+            f"(header_pages={header_pages}, "
+            f"total={total_pages})",
             flush=True,
         )
         return []
 
-    # Only create process pool when using local parsing
-    pool = None
-    loop = None
-    if parse_fn is None:
-        loop = asyncio.get_event_loop()
-        pool = concurrent.futures.ProcessPoolExecutor(
-            max_workers=max(
-                1, min(len(chunk_groups), os.cpu_count() or 4)
-            )
-        )
-
-    async def _parse_and_extract(idx: int, idx_slice: list[int]):
-        # Limit concurrent parsing so LLM calls can interleave
-        async with parse_sem:
-            print(f"[petey] chunk {idx}: parsing pages "
-                  f"{idx_slice}", flush=True)
-            if parse_fn is not None:
-                page_texts = await asyncio.gather(*[
-                    parse_fn(pdf_path, i, parser, ocr_backend)
-                    for i in idx_slice
-                ])
+    async def _parse_chunk(idx_slice):
+        """Subset the PDF and parse via the registry."""
+        chunk_path = _subset_pdf(pdf_path, idx_slice)
+        try:
+            if parser_is_async:
+                pages = await mgr.run(
+                    parser_fn, chunk_path,
+                )
             else:
-                futs = [
-                    loop.run_in_executor(
-                        pool, _parse_single_page,
-                        pdf_path, i, parser, ocr_backend,
-                    )
-                    for i in idx_slice
-                ]
-                page_texts = await asyncio.gather(*futs)
-        text = "\n\n".join(page_texts)
+                pages = await mgr.run_cpu(
+                    parser_fn, chunk_path,
+                )
+            return "\n\n".join(pages)
+        finally:
+            os.unlink(chunk_path)
+
+    async def _parse_and_extract(idx, idx_slice):
+        print(
+            f"[petey] chunk {idx}: parsing pages "
+            f"{idx_slice}", flush=True,
+        )
+        text = await _parse_chunk(idx_slice)
         if header_text:
             text = header_text + "\n\n" + text
         start = idx_slice[0] + 1
         end = idx_slice[-1] + 1
-        label = f"p{start}" if start == end else f"p{start}-{end}"
-        print(f"[petey] chunk {idx} ({label}): parsed, sending to LLM", flush=True)
+        label = (
+            f"p{start}" if start == end
+            else f"p{start}-{end}"
+        )
+        print(
+            f"[petey] chunk {idx} ({label}): "
+            f"parsed, sending to LLM", flush=True,
+        )
         if on_parse:
             on_parse(label, len(chunk_groups))
 
-        async with sem:
+        async with mgr.api():
             data = None
             ocr_retried = False
             for attempt in range(5):
                 try:
-                    result = await client.chat.completions.create(
-                        model=model,
-                        response_model=response_model,
-                        max_retries=2,
-                        messages=_make_messages(text, instructions),
-                        temperature=0,
+                    result = (
+                        await client.chat.completions.create(
+                            model=model,
+                            response_model=response_model,
+                            max_retries=2,
+                            messages=_make_messages(
+                                text, instructions,
+                            ),
+                            temperature=0,
+                        )
                     )
                     data = result.model_dump()
                     data["_page"] = label
@@ -1177,51 +1235,64 @@ async def extract_pages_async(
                     )
                     if is_rate_limit and attempt < 4:
                         wait = 2 ** attempt + 1
-                        print(f"[petey] {label}: rate limited, retrying in {wait}s (attempt {attempt + 1}/5)", flush=True)
+                        print(
+                            f"[petey] {label}: rate "
+                            f"limited, retrying in "
+                            f"{wait}s (attempt "
+                            f"{attempt + 1}/5)",
+                            flush=True,
+                        )
                         await asyncio.sleep(wait)
                         continue
-                    # On non-rate-limit failure, retry with OCR
-                    # (only when using local parsing; remote
-                    # parse_fn handles OCR internally)
-                    if (not ocr_retried
-                            and parse_fn is None):
+                    if not ocr_retried:
                         ocr_retried = True
                         print(
-                            f"[petey] {label}: extraction "
-                            f"failed ({err_str[:80]}), "
+                            f"[petey] {label}: "
+                            f"extraction failed "
+                            f"({err_str[:80]}), "
                             f"retrying with OCR",
                             flush=True,
                         )
                         try:
-                            futs = [
-                                loop.run_in_executor(
-                                    pool,
-                                    _ocr_single_page,
-                                    pdf_path, i,
-                                )
-                                for i in idx_slice
-                            ]
-                            ocr_pages = await asyncio.gather(
-                                *futs
+                            ocr_pages = (
+                                await asyncio.gather(*[
+                                    mgr.run_cpu(
+                                        _ocr_single_page,
+                                        pdf_path, i,
+                                    )
+                                    for i in idx_slice
+                                ])
                             )
-                            ocr_text = "\n\n".join(ocr_pages)
-                            if (ocr_text
-                                    and len(ocr_text.strip()) > 50):
+                            ocr_text = "\n\n".join(
+                                ocr_pages
+                            )
+                            if (
+                                ocr_text
+                                and len(
+                                    ocr_text.strip()
+                                ) > 50
+                            ):
                                 text = (
-                                    (header_text + "\n\n"
-                                     + ocr_text)
+                                    (
+                                        header_text
+                                        + "\n\n"
+                                        + ocr_text
+                                    )
                                     if header_text
                                     else ocr_text
                                 )
                                 continue
                         except Exception as ocr_err:
                             print(
-                                f"[petey] {label}: OCR "
-                                f"fallback also failed: "
-                                f"{ocr_err}",
+                                f"[petey] {label}: "
+                                f"OCR fallback also "
+                                f"failed: {ocr_err}",
                                 flush=True,
                             )
-                    data = {"_page": label, "_error": err_str}
+                    data = {
+                        "_page": label,
+                        "_error": err_str,
+                    }
                     break
             results[idx] = data
             if on_result:
@@ -1233,8 +1304,6 @@ async def extract_pages_async(
             for i, idx_slice in enumerate(chunk_groups)
         ]
     )
-    if pool is not None:
-        pool.shutdown(wait=False)
 
     # Deduplicate results, keeping first occurrence per unique row
     seen = set()
@@ -1301,40 +1370,55 @@ async def extract_batch(
         List of result dicts (with _source_file and optionally
         _error).
     """
-    sem = asyncio.Semaphore(concurrency)
+    mgr = get_manager()
+    mgr.configure(api_limit=concurrency)
     client = _make_client(model, api_key, llm_backend)
     results = []
 
+    parser_fn = PARSERS.get(parser)
+    parser_is_async = (
+        parser_fn is not None
+        and asyncio.iscoroutinefunction(parser_fn)
+    )
+
     async def _process(path: str):
-        async with sem:
-            try:
-                if parse_fn is not None:
-                    text = await parse_fn(
-                        path, parser, ocr_backend,
-                    )
-                else:
-                    text = await _extract_text_async(
-                        path, parser,
-                        ocr_fallback=ocr_fallback,
-                        ocr_backend=ocr_backend,
-                    )
-                result = await client.chat.completions.create(
-                    model=model,
-                    response_model=response_model,
-                    max_retries=2,
-                    messages=_make_messages(text, instructions),
-                    temperature=0,
+        try:
+            if parse_fn is not None:
+                text = await mgr.run(
+                    parse_fn, path, parser, ocr_backend,
                 )
-                data = result.model_dump()
-                data["_source_file"] = os.path.basename(path)
-            except Exception as e:
-                data = {
-                    "_source_file": os.path.basename(path),
-                    "_error": str(e),
-                }
-            results.append(data)
-            if on_result:
-                on_result(path, data)
+            elif parser_is_async:
+                pages = await mgr.run(
+                    parser_fn, path,
+                )
+                text = "\n\n".join(pages)
+            else:
+                text = await mgr.run_cpu(
+                    extract_text, path, parser,
+                    ocr_fallback, ocr_backend,
+                )
+            async with mgr.api():
+                result = (
+                    await client.chat.completions.create(
+                        model=model,
+                        response_model=response_model,
+                        max_retries=2,
+                        messages=_make_messages(
+                            text, instructions,
+                        ),
+                        temperature=0,
+                    )
+                )
+            data = result.model_dump()
+            data["_source_file"] = os.path.basename(path)
+        except Exception as e:
+            data = {
+                "_source_file": os.path.basename(path),
+                "_error": str(e),
+            }
+        results.append(data)
+        if on_result:
+            on_result(path, data)
 
     await asyncio.gather(*[_process(p) for p in pdf_paths])
     return results

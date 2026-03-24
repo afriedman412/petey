@@ -32,6 +32,7 @@ dependencies = [
     "pytesseract",
     "Pillow",
     "litellm",
+    "httpx",
 ]
 
 [project.urls]

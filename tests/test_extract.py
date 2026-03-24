@@ -2,10 +2,13 @@
 Tests for the petey package.
 Tests text extraction and schema building using MCI page 1 as test data.
 """
+import asyncio
 import json
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import (
+    AsyncMock, MagicMock, patch,
+)
 
 import pytest
 
@@ -579,6 +582,34 @@ class TestApiGetKey:
                 _api_get_key({"api_key_env": "MY_KEY"})
 
 
+def _mock_httpx_response(json_data, status_code=200):
+    """Build a mock httpx.Response."""
+    resp = MagicMock()
+    resp.json.return_value = json_data
+    resp.status_code = status_code
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+def _mock_async_client(post_resp, get_responses=None):
+    """Build a mock httpx.AsyncClient context manager.
+
+    post_resp: response for client.post()
+    get_responses: list of responses for client.get()
+        (cycled if shorter than calls)
+    """
+    client = MagicMock()
+    client.post = AsyncMock(return_value=post_resp)
+    if get_responses is not None:
+        client.get = AsyncMock(
+            side_effect=get_responses,
+        )
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=client)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    return ctx, client
+
+
 class TestApiPost:
     """Test the generic _api_post function with mocked HTTP."""
 
@@ -598,65 +629,72 @@ class TestApiPost:
     def test_multipart_no_poll(self):
         from petey.extract import _api_post
         cfg = self._make_cfg()
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"text": "extracted"}
-        mock_resp.raise_for_status = MagicMock()
+        resp = _mock_httpx_response({"text": "extracted"})
+        ctx, client = _mock_async_client(resp)
 
-        with patch("petey.extract._requests.post",
-                    return_value=mock_resp) as mock_post:
-            result = _api_post(cfg, b"file bytes", "doc.pdf",
-                               "application/pdf")
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
+            result = asyncio.run(
+                _api_post(cfg, b"file bytes",
+                          "doc.pdf", "application/pdf")
+            )
 
         assert result == "extracted"
-        mock_post.assert_called_once()
-        _, kwargs = mock_post.call_args
-        assert kwargs["files"]["file"][0] == "doc.pdf"
+        client.post.assert_called_once()
 
     @patch.dict(os.environ, {"TEST_KEY": "k"})
     def test_json_b64_no_poll(self):
         from petey.extract import _api_post
         import base64
         cfg = self._make_cfg(request_format="json_b64")
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = {"text": "from b64"}
-        mock_resp.raise_for_status = MagicMock()
+        resp = _mock_httpx_response({"text": "from b64"})
+        ctx, client = _mock_async_client(resp)
 
-        with patch("petey.extract._requests.post",
-                    return_value=mock_resp) as mock_post:
-            result = _api_post(cfg, b"raw", "f.png", "image/png")
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
+            result = asyncio.run(
+                _api_post(cfg, b"raw", "f.png",
+                          "image/png")
+            )
 
         assert result == "from b64"
-        _, kwargs = mock_post.call_args
-        body = json.loads(kwargs["data"])
-        assert body["file"] == base64.b64encode(b"raw").decode()
+        _, kwargs = client.post.call_args
+        body = json.loads(kwargs["content"])
+        assert body["file"] == base64.b64encode(
+            b"raw"
+        ).decode()
         assert body["filename"] == "f.png"
 
     @patch.dict(os.environ, {"TEST_KEY": "k"})
     def test_poll_flow(self):
         from petey.extract import _api_post
-        cfg = self._make_cfg(poll=True, response_key="markdown",
-                             timeout=10)
-        # First POST returns check URL
-        submit_resp = MagicMock()
-        submit_resp.json.return_value = {
-            "request_check_url": "https://example.com/check/123"}
-        submit_resp.raise_for_status = MagicMock()
-        # First poll: not done, second poll: done
-        poll_pending = MagicMock()
-        poll_pending.json.return_value = {"status": "pending"}
-        poll_pending.raise_for_status = MagicMock()
-        poll_done = MagicMock()
-        poll_done.json.return_value = {
-            "status": "complete", "markdown": "result text"}
-        poll_done.raise_for_status = MagicMock()
+        cfg = self._make_cfg(
+            poll=True, response_key="markdown",
+            timeout=10,
+        )
+        submit_resp = _mock_httpx_response(
+            {"request_check_url":
+                "https://example.com/check/123"},
+        )
+        poll_pending = _mock_httpx_response(
+            {"status": "pending"},
+        )
+        poll_done = _mock_httpx_response(
+            {"status": "complete",
+             "markdown": "result text"},
+        )
+        ctx, client = _mock_async_client(
+            submit_resp, [poll_pending, poll_done],
+        )
 
-        with patch("petey.extract._requests.post",
-                    return_value=submit_resp):
-            with patch("petey.extract._requests.get",
-                        side_effect=[poll_pending, poll_done]):
-                with patch("petey.extract._time.sleep"):
-                    result = _api_post(
-                        cfg, b"data", "f.pdf", "application/pdf")
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
+            with patch("petey.extract.asyncio.sleep",
+                        new_callable=AsyncMock):
+                result = asyncio.run(
+                    _api_post(cfg, b"data", "f.pdf",
+                              "application/pdf")
+                )
 
         assert result == "result text"
 
@@ -664,50 +702,62 @@ class TestApiPost:
     def test_poll_timeout(self):
         from petey.extract import _api_post
         cfg = self._make_cfg(poll=True, timeout=4)
-        submit_resp = MagicMock()
-        submit_resp.json.return_value = {
-            "request_check_url": "https://example.com/check/1"}
-        submit_resp.raise_for_status = MagicMock()
-        poll_resp = MagicMock()
-        poll_resp.json.return_value = {"status": "pending"}
-        poll_resp.raise_for_status = MagicMock()
+        submit_resp = _mock_httpx_response(
+            {"request_check_url":
+                "https://example.com/check/1"},
+        )
+        poll_resp = _mock_httpx_response(
+            {"status": "pending"},
+        )
+        ctx, _ = _mock_async_client(
+            submit_resp, [poll_resp, poll_resp],
+        )
 
-        with patch("petey.extract._requests.post",
-                    return_value=submit_resp):
-            with patch("petey.extract._requests.get",
-                        return_value=poll_resp):
-                with patch("petey.extract._time.sleep"):
-                    with pytest.raises(TimeoutError):
-                        _api_post(cfg, b"x", "f.pdf", "application/pdf")
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
+            with patch("petey.extract.asyncio.sleep",
+                        new_callable=AsyncMock):
+                with pytest.raises(TimeoutError):
+                    asyncio.run(
+                        _api_post(cfg, b"x", "f.pdf",
+                                  "application/pdf")
+                    )
 
     @patch.dict(os.environ, {"TEST_KEY": "k"})
     def test_missing_check_url(self):
         from petey.extract import _api_post
         cfg = self._make_cfg(poll=True)
-        resp = MagicMock()
-        resp.json.return_value = {}  # no check URL
-        resp.raise_for_status = MagicMock()
+        resp = _mock_httpx_response({})
+        ctx, _ = _mock_async_client(resp)
 
-        with patch("petey.extract._requests.post", return_value=resp):
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
             with pytest.raises(ValueError, match="check"):
-                _api_post(cfg, b"x", "f.pdf", "application/pdf")
+                asyncio.run(
+                    _api_post(cfg, b"x", "f.pdf",
+                              "application/pdf")
+                )
 
     @patch.dict(os.environ, {"TEST_KEY": "k"})
     def test_bearer_auth(self):
         from petey.extract import _api_post
         cfg = self._make_cfg(
-            auth_header="Authorization", auth_prefix="Bearer",
-            poll=False)
-        resp = MagicMock()
-        resp.json.return_value = {"text": "ok"}
-        resp.raise_for_status = MagicMock()
+            auth_header="Authorization",
+            auth_prefix="Bearer", poll=False,
+        )
+        resp = _mock_httpx_response({"text": "ok"})
+        ctx, client = _mock_async_client(resp)
 
-        with patch("petey.extract._requests.post",
-                    return_value=resp) as mock_post:
-            _api_post(cfg, b"x", "f.pdf", "application/pdf")
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
+            asyncio.run(
+                _api_post(cfg, b"x", "f.pdf",
+                          "application/pdf")
+            )
 
-        _, kwargs = mock_post.call_args
-        assert kwargs["headers"]["Authorization"] == "Bearer k"
+        _, kwargs = client.post.call_args
+        assert kwargs["headers"]["Authorization"] == \
+            "Bearer k"
 
     @patch.dict(os.environ, {"TEST_KEY": "k"})
     def test_custom_poll_keys(self):
@@ -719,24 +769,25 @@ class TestApiPost:
             poll_done_value="finished",
             response_key="output.text",
         )
-        submit_resp = MagicMock()
-        submit_resp.json.return_value = {
-            "job_url": "https://example.com/job/1"}
-        submit_resp.raise_for_status = MagicMock()
-        poll_done = MagicMock()
-        poll_done.json.return_value = {
-            "state": "finished",
-            "output": {"text": "custom result"},
-        }
-        poll_done.raise_for_status = MagicMock()
+        submit_resp = _mock_httpx_response(
+            {"job_url": "https://example.com/job/1"},
+        )
+        poll_done = _mock_httpx_response(
+            {"state": "finished",
+             "output": {"text": "custom result"}},
+        )
+        ctx, _ = _mock_async_client(
+            submit_resp, [poll_done],
+        )
 
-        with patch("petey.extract._requests.post",
-                    return_value=submit_resp):
-            with patch("petey.extract._requests.get",
-                        return_value=poll_done):
-                with patch("petey.extract._time.sleep"):
-                    result = _api_post(
-                        cfg, b"x", "f.pdf", "application/pdf")
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
+            with patch("petey.extract.asyncio.sleep",
+                        new_callable=AsyncMock):
+                result = asyncio.run(
+                    _api_post(cfg, b"x", "f.pdf",
+                              "application/pdf")
+                )
 
         assert result == "custom result"
 
@@ -745,16 +796,19 @@ class TestApiPost:
         from petey.extract import _api_post
         cfg = self._make_cfg(
             params={"output_format": "html", "lang": "en"},
-            poll=False)
-        resp = MagicMock()
-        resp.json.return_value = {"text": "ok"}
-        resp.raise_for_status = MagicMock()
+            poll=False,
+        )
+        resp = _mock_httpx_response({"text": "ok"})
+        ctx, client = _mock_async_client(resp)
 
-        with patch("petey.extract._requests.post",
-                    return_value=resp) as mock_post:
-            _api_post(cfg, b"x", "f.pdf", "application/pdf")
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
+            asyncio.run(
+                _api_post(cfg, b"x", "f.pdf",
+                          "application/pdf")
+            )
 
-        _, kwargs = mock_post.call_args
+        _, kwargs = client.post.call_args
         assert kwargs["data"]["output_format"] == "html"
         assert kwargs["data"]["lang"] == "en"
 
@@ -773,8 +827,12 @@ class TestParsePdfViaApi:
             "poll": False,
             "response_key": "text",
         }
-        with patch("petey.extract._api_post", return_value="parsed"):
-            result = _parse_pdf_via_api(str(pdf), cfg)
+        with patch("petey.extract._api_post",
+                    new_callable=AsyncMock,
+                    return_value="parsed"):
+            result = asyncio.run(
+                _parse_pdf_via_api(str(pdf), cfg)
+            )
         assert result == ["parsed"]
 
     @patch.dict(os.environ, {"TEST_KEY": "k"})
@@ -788,8 +846,12 @@ class TestParsePdfViaApi:
             "poll": False,
             "response_key": "text",
         }
-        with patch("petey.extract._api_post", return_value=""):
-            result = _parse_pdf_via_api(str(pdf), cfg)
+        with patch("petey.extract._api_post",
+                    new_callable=AsyncMock,
+                    return_value=""):
+            result = asyncio.run(
+                _parse_pdf_via_api(str(pdf), cfg)
+            )
         assert result == [""]
 
 
@@ -810,13 +872,15 @@ class TestOcrPageViaApi:
             "response_key": "text",
         }
         with patch("petey.extract._api_post",
+                    new_callable=AsyncMock,
                     return_value="ocr text") as mock_post:
-            result = _ocr_page_via_api(mock_page, cfg)
+            result = asyncio.run(
+                _ocr_page_via_api(mock_page, cfg)
+            )
 
         assert result == "ocr text"
         mock_page.get_pixmap.assert_called_once_with(dpi=200)
         args, _ = mock_post.call_args
-        # args: (cfg, file_bytes, filename, content_type)
         assert args[1] == b"png bytes"
         assert args[2] == "page.png"
         assert args[3] == "image/png"
@@ -873,6 +937,36 @@ class TestRegistries:
         from petey.extract import OCR_BACKENDS
         assert callable(OCR_BACKENDS["chandra"])
 
+    def test_local_parsers_are_sync(self):
+        from petey.extract import PARSERS
+        for name in ["pymupdf", "pdfplumber", "tables", "tabula"]:
+            assert not asyncio.iscoroutinefunction(
+                PARSERS[name]
+            ), f"Parser '{name}' should be sync"
+
+    def test_api_parsers_are_async(self):
+        from petey.extract import PARSERS, API_PARSERS
+        for name in API_PARSERS:
+            assert asyncio.iscoroutinefunction(
+                PARSERS[name]
+            ), f"Parser '{name}' should be async"
+
+    def test_local_ocr_backends_are_sync(self):
+        from petey.extract import OCR_BACKENDS
+        for name in ["tesseract", "mistral"]:
+            assert not asyncio.iscoroutinefunction(
+                OCR_BACKENDS[name]
+            ), f"OCR '{name}' should be sync"
+
+    def test_api_ocr_backends_are_async(self):
+        from petey.extract import (
+            OCR_BACKENDS, API_OCR_BACKENDS,
+        )
+        for name in API_OCR_BACKENDS:
+            assert asyncio.iscoroutinefunction(
+                OCR_BACKENDS[name]
+            ), f"OCR '{name}' should be async"
+
     def test_marker_uses_correct_endpoint(self):
         from petey.extract import API_PARSERS
         assert "marker" in API_PARSERS
@@ -912,15 +1006,20 @@ class TestLLMBackendConfig:
 # ---------------------------------------------------------------------------
 
 class TestApiIntegration:
-    """Test that API backends integrate with extract_text/extract_text_pages."""
+    """Test that API backends integrate with extract_text."""
 
     @patch.dict(os.environ, {"DATALAB_API_KEY": "test-key"})
     def test_marker_parser_via_extract_text(self, tmp_path):
         pdf = tmp_path / "test.pdf"
         pdf.write_bytes(b"fake pdf")
-        with patch("petey.extract._api_post",
-                    return_value="marker output") as mock:
-            text = extract_text(str(pdf), parser="marker")
+        with patch(
+            "petey.extract._api_post",
+            new_callable=AsyncMock,
+            return_value="marker output",
+        ):
+            text = extract_text(
+                str(pdf), parser="marker",
+            )
         assert text == "marker output"
 
     @patch.dict(os.environ, {"DATALAB_API_KEY": "test-key"})
@@ -931,11 +1030,16 @@ class TestApiIntegration:
         blank_pdf = tmp_path / "blank.pdf"
         doc.save(str(blank_pdf))
 
-        with patch("petey.extract._api_post",
-                    return_value="chandra ocr") as mock:
+        with patch(
+            "petey.extract._api_post",
+            new_callable=AsyncMock,
+            return_value="chandra ocr",
+        ):
             text = extract_text(
-                str(blank_pdf), parser="pdfplumber",
-                ocr_backend="chandra")
+                str(blank_pdf),
+                parser="pdfplumber",
+                ocr_backend="chandra",
+            )
         assert "chandra ocr" in text
 
     def test_unknown_parser_raises(self, tmp_path):
@@ -955,3 +1059,589 @@ class TestApiIntegration:
             extract_text(
                 str(blank_pdf), parser="pdfplumber",
                 ocr_backend="buttocr")
+
+
+# -----------------------------------------------------------
+# ConcurrencyManager
+# -----------------------------------------------------------
+
+def _add(a, b):
+    return a + b
+
+
+def _triple(x):
+    return x * 3
+
+
+def _one():
+    return 1
+
+
+class TestConcurrencyManager:
+    """Test the ConcurrencyManager from petey.concurrency."""
+
+    def test_singleton(self):
+        from petey.concurrency import get_manager
+        a = get_manager()
+        b = get_manager()
+        assert a is b
+
+    def test_defaults(self):
+        from petey.concurrency import ConcurrencyManager
+        mgr = ConcurrencyManager()
+        assert mgr.cpu_limit >= 1
+        assert mgr.api_limit == 10
+
+    def test_configure(self):
+        from petey.concurrency import ConcurrencyManager
+        mgr = ConcurrencyManager()
+        mgr.configure(cpu_limit=2, api_limit=5)
+        assert mgr.cpu_limit == 2
+        assert mgr.api_limit == 5
+
+    def test_run_cpu_dispatches_sync(self):
+        from petey.concurrency import ConcurrencyManager
+        mgr = ConcurrencyManager(cpu_limit=2)
+        result = asyncio.run(mgr.run_cpu(_add, 1, 2))
+        assert result == 3
+
+    def test_run_dispatches_async(self):
+        from petey.concurrency import ConcurrencyManager
+
+        async def double(x):
+            return x * 2
+
+        mgr = ConcurrencyManager()
+        result = asyncio.run(mgr.run(double, 5))
+        assert result == 10
+
+    def test_run_dispatches_sync_to_cpu(self):
+        from petey.concurrency import ConcurrencyManager
+        mgr = ConcurrencyManager(cpu_limit=1)
+        result = asyncio.run(mgr.run(_triple, 4))
+        assert result == 12
+
+    def test_api_semaphore(self):
+        from petey.concurrency import ConcurrencyManager
+        mgr = ConcurrencyManager(api_limit=1)
+
+        async def check():
+            async with mgr.api():
+                return "ok"
+
+        assert asyncio.run(check()) == "ok"
+
+    def test_shutdown(self):
+        from petey.concurrency import ConcurrencyManager
+        mgr = ConcurrencyManager(cpu_limit=1)
+        asyncio.run(mgr.run_cpu(_one))
+        assert mgr._cpu_pool is not None
+        mgr.shutdown()
+        assert mgr._cpu_pool is None
+
+
+# -----------------------------------------------------------
+# Async extraction ← ConcurrencyManager integration
+# -----------------------------------------------------------
+
+def _mock_llm_client():
+    """Build a mock instructor client for LLM calls."""
+    mock_result = MagicMock()
+    mock_result.model_dump.return_value = {"field": "value"}
+    client = MagicMock()
+    client.chat.completions.create = AsyncMock(
+        return_value=mock_result,
+    )
+    return client
+
+
+class TestExtractAsyncConcurrency:
+    """Verify extract_async routes work through the manager."""
+
+    def test_local_parser_uses_cpu_pool(self):
+        """Local (sync) parsing should go through run_cpu."""
+        from petey.extract import extract_async
+        from petey.concurrency import ConcurrencyManager
+        from pydantic import BaseModel
+
+        class M(BaseModel):
+            field: str | None = None
+
+        calls = {"run_cpu": 0, "api": 0}
+        orig_run_cpu = ConcurrencyManager.run_cpu
+        orig_api = ConcurrencyManager.api
+
+        async def spy_run_cpu(self, fn, *a):
+            calls["run_cpu"] += 1
+            return await orig_run_cpu(self, fn, *a)
+
+        def spy_api(self):
+            calls["api"] += 1
+            return orig_api(self)
+
+        with patch.object(
+            ConcurrencyManager, "run_cpu", spy_run_cpu,
+        ):
+            with patch.object(
+                ConcurrencyManager, "api", spy_api,
+            ):
+                with patch(
+                    "petey.extract._make_client",
+                    return_value=_mock_llm_client(),
+                ):
+                    result = asyncio.run(
+                        extract_async(
+                            str(MCI_PDF), M,
+                            parser="pymupdf",
+                        )
+                    )
+
+        assert calls["run_cpu"] >= 1, (
+            "Local parsing should use run_cpu"
+        )
+        assert calls["api"] >= 1, (
+            "LLM call should use api semaphore"
+        )
+
+    def test_async_parse_fn_uses_run(self):
+        """Async parse_fn should go through run() (API pool)."""
+        from petey.extract import extract_async
+        from petey.concurrency import ConcurrencyManager
+        from pydantic import BaseModel
+
+        class M(BaseModel):
+            field: str | None = None
+
+        calls = {"run": 0, "run_cpu": 0, "api": 0}
+        orig_run = ConcurrencyManager.run
+        orig_api = ConcurrencyManager.api
+
+        async def spy_run(self, fn, *a):
+            calls["run"] += 1
+            return await orig_run(self, fn, *a)
+
+        async def spy_run_cpu(self, fn, *a):
+            calls["run_cpu"] += 1
+
+        def spy_api(self):
+            calls["api"] += 1
+            return orig_api(self)
+
+        async def fake_parse(path, parser, ocr):
+            return "fake text from API parser"
+
+        with patch.object(
+            ConcurrencyManager, "run", spy_run,
+        ):
+            with patch.object(
+                ConcurrencyManager, "run_cpu",
+                spy_run_cpu,
+            ):
+                with patch.object(
+                    ConcurrencyManager, "api", spy_api,
+                ):
+                    with patch(
+                        "petey.extract._make_client",
+                        return_value=_mock_llm_client(),
+                    ):
+                        result = asyncio.run(
+                            extract_async(
+                                str(MCI_PDF), M,
+                                parse_fn=fake_parse,
+                            )
+                        )
+
+        assert calls["run"] >= 1, (
+            "Async parse_fn should use run()"
+        )
+        assert calls["run_cpu"] == 0, (
+            "Should NOT use run_cpu for async parse_fn"
+        )
+        assert calls["api"] >= 1, (
+            "LLM call should use api semaphore"
+        )
+
+
+class TestRegistryDispatchConcurrency:
+    """Verify registry entries route through correct pool."""
+
+    @patch.dict(os.environ, {"DATALAB_API_KEY": "test-key"})
+    def test_marker_parser_routes_to_api_pool(self, tmp_path):
+        """parser='marker' (async registry entry) should
+        go through run() → API pool, not run_cpu()."""
+        from petey.extract import extract_async
+        from petey.concurrency import ConcurrencyManager
+        from pydantic import BaseModel
+
+        class M(BaseModel):
+            field: str | None = None
+
+        calls = {"run": 0, "run_cpu": 0}
+        orig_run = ConcurrencyManager.run
+
+        async def spy_run(self, fn, *a):
+            calls["run"] += 1
+            return await orig_run(self, fn, *a)
+
+        async def spy_run_cpu(self, fn, *a):
+            calls["run_cpu"] += 1
+            return ""
+
+        pdf = tmp_path / "test.pdf"
+        pdf.write_bytes(b"fake pdf")
+
+        with patch.object(
+            ConcurrencyManager, "run", spy_run,
+        ):
+            with patch.object(
+                ConcurrencyManager, "run_cpu",
+                spy_run_cpu,
+            ):
+                with patch(
+                    "petey.extract._api_post",
+                    new_callable=AsyncMock,
+                    return_value="marker text",
+                ):
+                    with patch(
+                        "petey.extract._make_client",
+                        return_value=_mock_llm_client(),
+                    ):
+                        asyncio.run(
+                            extract_async(
+                                str(pdf), M,
+                                parser="marker",
+                            )
+                        )
+
+        assert calls["run"] >= 1, (
+            "marker (async) should route through run()"
+        )
+        assert calls["run_cpu"] == 0, (
+            "marker should NOT use run_cpu"
+        )
+
+    @patch.dict(
+        os.environ, {"DATALAB_API_KEY": "test-key"},
+    )
+    def test_pymupdf_parser_routes_to_cpu_pool(self):
+        """parser='pymupdf' (sync registry entry) should
+        go through run_cpu() → CPU pool."""
+        from petey.extract import extract_async
+        from petey.concurrency import ConcurrencyManager
+        from pydantic import BaseModel
+
+        class M(BaseModel):
+            field: str | None = None
+
+        calls = {"run": 0, "run_cpu": 0}
+        orig_run_cpu = ConcurrencyManager.run_cpu
+
+        async def spy_run(self, fn, *a):
+            calls["run"] += 1
+            return ""
+
+        async def spy_run_cpu(self, fn, *a):
+            calls["run_cpu"] += 1
+            return await orig_run_cpu(self, fn, *a)
+
+        with patch.object(
+            ConcurrencyManager, "run", spy_run,
+        ):
+            with patch.object(
+                ConcurrencyManager, "run_cpu",
+                spy_run_cpu,
+            ):
+                with patch(
+                    "petey.extract._make_client",
+                    return_value=_mock_llm_client(),
+                ):
+                    asyncio.run(
+                        extract_async(
+                            str(MCI_PDF), M,
+                            parser="pymupdf",
+                        )
+                    )
+
+        assert calls["run_cpu"] >= 1, (
+            "pymupdf (sync) should route through run_cpu()"
+        )
+        assert calls["run"] == 0, (
+            "pymupdf should NOT use run()"
+        )
+
+
+class TestExtractBatchConcurrency:
+    """Verify extract_batch routes through the manager."""
+
+    def test_local_parser_uses_cpu_pool(self, tmp_path):
+        from petey.extract import extract_batch
+        from petey.concurrency import ConcurrencyManager
+        from pydantic import BaseModel
+        import fitz
+
+        class M(BaseModel):
+            field: str | None = None
+
+        # Create a tiny valid PDF
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "test content")
+        pdf = tmp_path / "test.pdf"
+        doc.save(str(pdf))
+        doc.close()
+
+        calls = {"run_cpu": 0, "api": 0}
+        orig_run_cpu = ConcurrencyManager.run_cpu
+        orig_api = ConcurrencyManager.api
+
+        async def spy_run_cpu(self, fn, *a):
+            calls["run_cpu"] += 1
+            return await orig_run_cpu(self, fn, *a)
+
+        def spy_api(self):
+            calls["api"] += 1
+            return orig_api(self)
+
+        with patch.object(
+            ConcurrencyManager, "run_cpu", spy_run_cpu,
+        ):
+            with patch.object(
+                ConcurrencyManager, "api", spy_api,
+            ):
+                with patch(
+                    "petey.extract._make_client",
+                    return_value=_mock_llm_client(),
+                ):
+                    results = asyncio.run(
+                        extract_batch(
+                            [str(pdf)], M,
+                            parser="pymupdf",
+                        )
+                    )
+
+        assert calls["run_cpu"] >= 1, (
+            "Local parsing should use run_cpu"
+        )
+        assert calls["api"] >= 1, (
+            "LLM call should use api semaphore"
+        )
+        assert len(results) == 1
+        assert results[0]["field"] == "value"
+
+    def test_async_parse_fn_uses_run(self, tmp_path):
+        from petey.extract import extract_batch
+        from petey.concurrency import ConcurrencyManager
+        from pydantic import BaseModel
+
+        class M(BaseModel):
+            field: str | None = None
+
+        calls = {"run": 0, "run_cpu": 0, "api": 0}
+        orig_run = ConcurrencyManager.run
+        orig_api = ConcurrencyManager.api
+
+        async def spy_run(self, fn, *a):
+            calls["run"] += 1
+            return await orig_run(self, fn, *a)
+
+        async def spy_run_cpu(self, fn, *a):
+            calls["run_cpu"] += 1
+
+        def spy_api(self):
+            calls["api"] += 1
+            return orig_api(self)
+
+        async def fake_parse(path, parser, ocr):
+            return "fake text"
+
+        with patch.object(
+            ConcurrencyManager, "run", spy_run,
+        ):
+            with patch.object(
+                ConcurrencyManager, "run_cpu",
+                spy_run_cpu,
+            ):
+                with patch.object(
+                    ConcurrencyManager, "api", spy_api,
+                ):
+                    with patch(
+                        "petey.extract._make_client",
+                        return_value=_mock_llm_client(),
+                    ):
+                        results = asyncio.run(
+                            extract_batch(
+                                ["fake.pdf"], M,
+                                parse_fn=fake_parse,
+                            )
+                        )
+
+        assert calls["run"] >= 1, (
+            "Async parse_fn should use run()"
+        )
+        assert calls["run_cpu"] == 0, (
+            "Should NOT use run_cpu for async parse_fn"
+        )
+        assert calls["api"] >= 1, (
+            "LLM call should use api semaphore"
+        )
+
+
+# -----------------------------------------------------------
+# PDF subsetting + extract_pages_async registry dispatch
+# -----------------------------------------------------------
+
+class TestSubsetPdf:
+    """Test the _subset_pdf helper."""
+
+    def test_subset_single_page(self):
+        import fitz
+        from petey.extract import _subset_pdf
+
+        subset_path = _subset_pdf(str(MCI_PDF), [0])
+        try:
+            doc = fitz.open(subset_path)
+            assert len(doc) == 1
+            text = doc[0].get_text("text")
+            doc.close()
+            assert "WESTCHESTER" in text
+        finally:
+            os.unlink(subset_path)
+
+    def test_subset_preserves_page_order(self, tmp_path):
+        import fitz
+        from petey.extract import _subset_pdf
+
+        # Create a 3-page PDF with distinct content
+        doc = fitz.open()
+        for i in range(3):
+            page = doc.new_page()
+            page.insert_text(
+                (72, 72), f"PAGE_{i}",
+            )
+        src = tmp_path / "src.pdf"
+        doc.save(str(src))
+        doc.close()
+
+        # Subset pages 2 and 0 (reversed)
+        subset_path = _subset_pdf(str(src), [2, 0])
+        try:
+            sub = fitz.open(subset_path)
+            assert len(sub) == 2
+            assert "PAGE_2" in sub[0].get_text("text")
+            assert "PAGE_0" in sub[1].get_text("text")
+            sub.close()
+        finally:
+            os.unlink(subset_path)
+
+    def test_subset_cleanup(self):
+        from petey.extract import _subset_pdf
+
+        path = _subset_pdf(str(MCI_PDF), [0])
+        assert os.path.exists(path)
+        os.unlink(path)
+        assert not os.path.exists(path)
+
+
+class TestExtractPagesAsyncRegistry:
+    """Verify extract_pages_async uses registry + subsetting."""
+
+    def test_uses_registry_parser(self):
+        """extract_pages_async should dispatch through
+        the manager via the registry."""
+        from petey.extract import extract_pages_async
+        from petey.concurrency import ConcurrencyManager
+        from pydantic import BaseModel
+
+        class M(BaseModel):
+            field: str | None = None
+
+        calls = {"run_cpu": 0}
+        orig_run_cpu = ConcurrencyManager.run_cpu
+
+        async def spy_run_cpu(self, fn, *a):
+            calls["run_cpu"] += 1
+            return await orig_run_cpu(self, fn, *a)
+
+        with patch.object(
+            ConcurrencyManager, "run_cpu", spy_run_cpu,
+        ):
+            with patch(
+                "petey.extract._make_client",
+                return_value=_mock_llm_client(),
+            ):
+                results = asyncio.run(
+                    extract_pages_async(
+                        str(MCI_PDF), M,
+                        parser="pymupdf",
+                    )
+                )
+
+        assert calls["run_cpu"] >= 1
+        assert len(results) >= 1
+
+    @patch.dict(os.environ, {"DATALAB_API_KEY": "k"})
+    def test_api_parser_uses_run(self):
+        """parser='marker' should go through mgr.run()
+        (API pool) via subsetting."""
+        from petey.extract import extract_pages_async
+        from petey.concurrency import ConcurrencyManager
+        from pydantic import BaseModel
+
+        class M(BaseModel):
+            field: str | None = None
+
+        calls = {"run": 0, "run_cpu": 0}
+        orig_run = ConcurrencyManager.run
+
+        async def spy_run(self, fn, *a):
+            calls["run"] += 1
+            return await orig_run(self, fn, *a)
+
+        async def spy_run_cpu(self, fn, *a):
+            calls["run_cpu"] += 1
+            return ""
+
+        with patch.object(
+            ConcurrencyManager, "run", spy_run,
+        ):
+            with patch.object(
+                ConcurrencyManager, "run_cpu",
+                spy_run_cpu,
+            ):
+                with patch(
+                    "petey.extract._api_post",
+                    new_callable=AsyncMock,
+                    return_value="marker text",
+                ):
+                    with patch(
+                        "petey.extract._make_client",
+                        return_value=_mock_llm_client(),
+                    ):
+                        asyncio.run(
+                            extract_pages_async(
+                                str(MCI_PDF), M,
+                                parser="marker",
+                            )
+                        )
+
+        assert calls["run"] >= 1, (
+            "marker should route through run()"
+        )
+        assert calls["run_cpu"] == 0, (
+            "marker should NOT use run_cpu"
+        )
+
+    def test_unknown_parser_raises(self):
+        from petey.extract import extract_pages_async
+        from pydantic import BaseModel
+
+        class M(BaseModel):
+            field: str | None = None
+
+        with pytest.raises(ValueError, match="not found"):
+            asyncio.run(
+                extract_pages_async(
+                    str(MCI_PDF), M,
+                    parser="nonexistent",
+                )
+            )
