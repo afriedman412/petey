@@ -29,6 +29,9 @@ The first step is getting text out of the PDF. Different extractors work better 
 | `tables` | included | Bordered tables | Uses PyMuPDF's table detection to find cells and extract them as TSV. Falls back to plain text for pages without tables. Default for array schemas. |
 | `pdfplumber` | included | Borderless tables | Layout-preserving extraction that positions text spatially. Good for documents where columns are aligned by whitespace rather than cell borders. |
 | `tabula` | `pip install petey[tabula]` | Structured tables | Uses tabula-py (Java-based) to detect and extract tables as DataFrames. Falls back to pymupdf for pages without tables. Requires Java. |
+| `marker` | included | Complex layouts | Remote API via Datalab. Requires `DATALAB_API_KEY`. |
+
+Parsers are registered in the `PARSERS` dict. Local parsers are sync functions; API parsers (like `marker`) are async and automatically routed through the API concurrency pool. To add a new API parser, add an entry to `API_PARSERS` — no new code needed.
 
 ### OCR Backends
 
@@ -39,6 +42,9 @@ If a PDF has no embedded text layer (e.g. a scanned document), Petey can fall ba
 | `none` | — | No OCR. Default. |
 | `tesseract` | included | Local OCR via pytesseract. Requires the Tesseract binary installed on your system. |
 | `mistral` | `pip install petey[mistral-ocr]` | Cloud OCR via Mistral's `mistral-ocr-latest` model. Sends page images to the Mistral API. Requires `MISTRAL_API_KEY`. |
+| `chandra` | included | Cloud OCR via Datalab. Requires `DATALAB_API_KEY`. |
+
+Like parsers, OCR backends are registered in `OCR_BACKENDS`. API backends are async and can be added via `API_OCR_BACKENDS`.
 
 ### LLM Backends
 
@@ -49,6 +55,55 @@ The LLM interprets the extracted text and returns structured data matching your 
 | `openai` | included | `gpt-4.1-mini`, `gpt-4o`, etc. | Model name doesn't match other patterns (default) |
 | `anthropic` | included | `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, etc. | Model starts with `claude` |
 | `litellm` | included | Gemini, Mistral, Ollama, Bedrock, Vertex AI, Cohere, 100+ more | Model starts with `gemini/`, `mistral/`, `ollama/`, `bedrock/`, etc. |
+
+### Adding Custom Backends
+
+Each pipeline step has a config dict for adding API-based backends without writing code:
+
+```python
+from petey.extract import API_PARSERS, API_OCR_BACKENDS, API_LLM_BACKENDS
+
+# Add a new PDF parser
+API_PARSERS["my_parser"] = {
+    "endpoint": "https://my-api.com/parse",
+    "api_key_env": "MY_API_KEY",
+    "response_key": "markdown",
+    "poll": True,  # poll for async results
+}
+
+# Add a new OCR backend
+API_OCR_BACKENDS["my_ocr"] = {
+    "endpoint": "https://my-api.com/ocr",
+    "api_key_env": "MY_API_KEY",
+    "response_key": "text",
+    "poll": False,  # synchronous response
+}
+
+# Add an OpenAI-compatible LLM endpoint
+API_LLM_BACKENDS["my_llm"] = {
+    "client": "openai",
+    "base_url": "https://my-host.com/v1",
+    "api_key_env": "MY_LLM_KEY",
+}
+```
+
+API parser and OCR backends are automatically async and route through the API concurrency pool.
+
+### Concurrency
+
+Petey uses a process-wide `ConcurrencyManager` with two pools:
+
+- **CPU pool** — local parsing (pymupdf, pdfplumber, tesseract). Backed by a `ProcessPoolExecutor`, sized to CPU cores.
+- **API pool** — remote calls (LLM, Marker, Chandra, Mistral OCR). Bounded by an `asyncio.Semaphore`, configurable via `--concurrency` (default 10).
+
+The manager automatically dispatches work to the right pool based on whether the callable is sync (CPU) or async (API). For array schemas, pages are subsetted into individual temp PDFs and dispatched independently, so parsing page N and LLM extraction of page N-1 happen in parallel.
+
+```python
+from petey.concurrency import configure
+
+# Adjust limits
+configure(cpu_limit=4, api_limit=20)
+```
 
 ## Setup
 
@@ -115,7 +170,7 @@ All fields are nullable — Petey returns `null` for anything it can't find rath
 | `instructions` | Extra guidance appended to the prompt (e.g. "ignore the summary row") |
 | `header_pages` | Number of leading pages to treat as a document header (see below) |
 | `pages` | Page range to process, e.g. `"2-5"` or `"1,3,5-7"` (1-indexed) |
-| `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, or `tabula` |
+| `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, `tabula`, or `marker` |
 
 ## Use Cases
 
@@ -216,8 +271,8 @@ petey extract --schema schema.yaml ./pdfs/ -o results.csv
 | `--output / -o` | stdout | Output file path |
 | `--format / -f` | inferred | `csv`, `json`, or `jsonl` |
 | `--instructions / -i` | — | Extra extraction instructions |
-| `--parser` | `pymupdf` | Text extraction backend (`pymupdf`, `tables`, `pdfplumber`, `tabula`) |
-| `--ocr` | `none` | OCR backend (`none`, `tesseract`, `mistral`) |
+| `--parser` | `pymupdf` | Text extraction backend (`pymupdf`, `tables`, `pdfplumber`, `tabula`, `marker`) |
+| `--ocr` | `none` | OCR backend (`none`, `tesseract`, `mistral`, `chandra`) |
 | `--llm-backend / -b` | auto-detect | LLM backend (`openai`, `anthropic`, `litellm`) |
 | `--pages-per-chunk / -p` | `1` for arrays | Pages per LLM call (set to `0` to disable chunking) |
 
