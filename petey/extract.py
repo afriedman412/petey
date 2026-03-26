@@ -5,7 +5,7 @@ Configure via environment variables or pass explicitly.
 Pipeline architecture::
 
     PDF
-     └─ TextExtractor      (pymupdf | pdfplumber | tabula | marker)
+     └─ TextExtractor      (pymupdf | pdfplumber | tabula | marker | llamaparse | docling | …)
           └─ OCRBackend    (tesseract | mistral | chandra | none)
                └─ LLMBackend  (openai | anthropic | litellm)
                     └─ Output  (csv | json | jsonl)
@@ -16,6 +16,7 @@ import asyncio
 import base64
 from petey.concurrency import get_manager
 from functools import partial
+import importlib
 import json
 import os
 import tempfile
@@ -375,15 +376,58 @@ async def _ocr_page_via_api(page, cfg: dict) -> str:
     )
 
 
+# --- Plugin registries ---
+#
+# Register local backends that live outside extract.py.  Each entry maps a
+# name to a "module.path:callable" string.  The callable is lazy-imported
+# the first time someone selects that backend, so heavyweight dependencies
+# (like docling) are never loaded unless needed.
+#
+# Callable contracts:
+#   PLUGIN_PARSERS:      (pdf_path: str) -> list[str]  (one string per page)
+#   PLUGIN_OCR_BACKENDS: (page: fitz.Page) -> str
+#   PLUGIN_LLM_BACKENDS: same as _LLM_CLIENT_BUILDERS — a client factory
+#
+# Users can add their own:
+#   from petey.extract import PLUGIN_PARSERS
+#   PLUGIN_PARSERS["my_parser"] = "my_package.pdf:extract_pages"
+
+PLUGIN_PARSERS: dict[str, str] = {
+    "docling": "petey.plugins.docling:extract_pages",
+}
+
+PLUGIN_OCR_BACKENDS: dict[str, str] = {}
+
+PLUGIN_LLM_BACKENDS: dict[str, str] = {}
+
+
+def _make_plugin_loader(import_path: str):
+    """Return a wrapper that lazy-imports a plugin callable on first use."""
+    _fn = None
+
+    def _lazy(*args, **kwargs):
+        nonlocal _fn
+        if _fn is None:
+            module_path, func_name = import_path.split(":")
+            module = importlib.import_module(module_path)
+            _fn = getattr(module, func_name)
+        return _fn(*args, **kwargs)
+
+    return _lazy
+
+
 # --- Parser registry ---
 # Each parser is a callable: (pdf_path: str) -> list[str]
 # Local parsers are plain functions; API parsers are built from config.
+# Plugin parsers are lazy-imported on first use.
 
 PARSERS = {
     "pymupdf": _extract_text_pages_pymupdf,
     "tables": _extract_text_pages_tables,
     "pdfplumber": _extract_text_pages_pdfplumber,
     "tabula": _extract_text_pages_tabula,
+    **{name: _make_plugin_loader(path)
+       for name, path in PLUGIN_PARSERS.items()},
     **{name: partial(_parse_pdf_via_api, cfg=cfg)
        for name, cfg in API_PARSERS.items()},
 }
@@ -538,6 +582,8 @@ def _ocr_page_mistral(page) -> str:
 OCR_BACKENDS = {
     "tesseract": _ocr_page_tesseract,
     "mistral": _ocr_page_mistral,
+    **{name: _make_plugin_loader(path)
+       for name, path in PLUGIN_OCR_BACKENDS.items()},
     **{name: partial(_ocr_page_via_api, cfg=cfg)
        for name, cfg in API_OCR_BACKENDS.items()},
 }
@@ -703,6 +749,8 @@ def _make_api_llm_client(api_key: str | None = None, **cfg):
 
 LLM_BACKENDS = {
     **_LLM_CLIENT_BUILDERS,
+    **{name: _make_plugin_loader(path)
+       for name, path in PLUGIN_LLM_BACKENDS.items()},
     **{name: partial(_make_api_llm_client, **cfg)
        for name, cfg in API_LLM_BACKENDS.items()},
 }
