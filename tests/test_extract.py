@@ -583,22 +583,22 @@ class TestParsers:
         assert _resolve_ocr_backend(False, "tesseract") == "tesseract"
 
     def test_mistral_ocr_import_error(self):
-        from petey.extract import _ocr_page_mistral
+        from petey.plugins.mistral_ocr import ocr_page
         mock_page = MagicMock()
         with patch.dict("sys.modules", {"mistralai": None}):
             with pytest.raises(
                 ImportError, match="petey\\[mistral-ocr\\]"
             ):
-                _ocr_page_mistral(mock_page)
+                ocr_page(mock_page)
 
     def test_mistral_ocr_missing_api_key(self):
-        from petey.extract import _ocr_page_mistral
+        from petey.plugins.mistral_ocr import ocr_page
         mock_mistralai = MagicMock()
         mock_page = MagicMock()
         with patch.dict("sys.modules", {"mistralai": mock_mistralai}):
             with patch.dict(os.environ, {}, clear=True):
                 with pytest.raises(ValueError, match="MISTRAL_API_KEY"):
-                    _ocr_page_mistral(mock_page)
+                    ocr_page(mock_page)
 
     def test_ocr_backend_falls_back_to_pdfplumber(self):
         """When --ocr is set with pymupdf parser, should switch to pdfplumber
@@ -1012,11 +1012,19 @@ class TestRegistries:
     def test_parser_registry_has_api_backends(self):
         from petey.extract import PARSERS
         assert "marker" in PARSERS
+        assert "llamaparse" in PARSERS
+
+    def test_parser_registry_has_plugin_backends(self):
+        from petey.extract import PARSERS
+        assert "docling" in PARSERS
 
     def test_ocr_registry_has_local_backends(self):
         from petey.extract import OCR_BACKENDS
-        for name in ["tesseract", "mistral"]:
-            assert name in OCR_BACKENDS, f"Missing OCR: {name}"
+        assert "tesseract" in OCR_BACKENDS
+
+    def test_ocr_registry_has_plugin_backends(self):
+        from petey.extract import OCR_BACKENDS
+        assert "mistral" in OCR_BACKENDS
 
     def test_ocr_registry_has_api_backends(self):
         from petey.extract import OCR_BACKENDS
@@ -1041,7 +1049,7 @@ class TestRegistries:
 
     def test_api_parsers_are_callable(self):
         from petey.extract import PARSERS
-        for name in ["marker"]:
+        for name in ["marker", "llamaparse"]:
             assert callable(PARSERS[name])
 
     def test_api_ocr_are_callable(self):
@@ -1064,10 +1072,17 @@ class TestRegistries:
 
     def test_local_ocr_backends_are_sync(self):
         from petey.extract import OCR_BACKENDS
-        for name in ["tesseract", "mistral"]:
+        for name in ["tesseract"]:
             assert not asyncio.iscoroutinefunction(
                 OCR_BACKENDS[name]
             ), f"OCR '{name}' should be sync"
+
+    def test_plugin_ocr_backends_are_callable(self):
+        from petey.extract import OCR_BACKENDS, PLUGIN_OCR_BACKENDS
+        for name in PLUGIN_OCR_BACKENDS:
+            assert callable(
+                OCR_BACKENDS[name]
+            ), f"Plugin OCR '{name}' should be callable"
 
     def test_api_ocr_backends_are_async(self):
         from petey.extract import (
@@ -1756,3 +1771,180 @@ class TestExtractPagesAsyncRegistry:
                     parser="nonexistent",
                 )
             )
+
+
+# ---------------------------------------------------------------------------
+# poll_url_template
+# ---------------------------------------------------------------------------
+
+class TestPollUrlTemplate:
+    """Test poll_url_template support in _api_post."""
+
+    def _make_cfg(self, **overrides):
+        cfg = {
+            "endpoint": "https://example.com/api/upload",
+            "api_key_env": "TEST_KEY",
+            "auth_header": "Authorization",
+            "auth_prefix": "Bearer",
+            "response_key": "markdown",
+            "poll": True,
+            "timeout": 10,
+            "params": {},
+        }
+        cfg.update(overrides)
+        return cfg
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_poll_url_template_constructs_correct_url(self):
+        from petey.extract import _api_post
+        cfg = self._make_cfg(
+            poll_check_key="id",
+            poll_url_template=(
+                "https://api.example.com/job/{id}/result/markdown"
+            ),
+            poll_status_key="status",
+            poll_done_value="done",
+        )
+        submit_resp = _mock_httpx_response({"id": "job-42"})
+        poll_done = _mock_httpx_response(
+            {"status": "done", "markdown": "ok"},
+        )
+        ctx, client = _mock_async_client(
+            submit_resp, [poll_done],
+        )
+
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
+            with patch("petey.extract.asyncio.sleep",
+                        new_callable=AsyncMock):
+                asyncio.run(
+                    _api_post(cfg, b"x", "f.pdf",
+                              "application/pdf")
+                )
+
+        poll_url = client.get.call_args[0][0]
+        assert poll_url == (
+            "https://api.example.com/job/job-42/result/markdown"
+        )
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_poll_url_template_missing_key_raises(self):
+        from petey.extract import _api_post
+        cfg = self._make_cfg(
+            poll_check_key="id",
+            poll_url_template="https://example.com/job/{id}",
+        )
+        # Response missing the "id" key
+        submit_resp = _mock_httpx_response({})
+        ctx, _ = _mock_async_client(submit_resp)
+
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
+            with pytest.raises(ValueError, match="id"):
+                asyncio.run(
+                    _api_post(cfg, b"x", "f.pdf",
+                              "application/pdf")
+                )
+
+    @patch.dict(os.environ, {"TEST_KEY": "k"})
+    def test_without_template_uses_raw_url(self):
+        """Existing behaviour: poll_check_key is a full URL."""
+        from petey.extract import _api_post
+        cfg = self._make_cfg(
+            poll_check_key="request_check_url",
+            poll_status_key="status",
+            poll_done_value="complete",
+        )
+        submit_resp = _mock_httpx_response(
+            {"request_check_url": "https://example.com/check/1"},
+        )
+        poll_done = _mock_httpx_response(
+            {"status": "complete", "markdown": "text"},
+        )
+        ctx, client = _mock_async_client(
+            submit_resp, [poll_done],
+        )
+
+        with patch("petey.extract.httpx.AsyncClient",
+                    return_value=ctx):
+            with patch("petey.extract.asyncio.sleep",
+                        new_callable=AsyncMock):
+                result = asyncio.run(
+                    _api_post(cfg, b"x", "f.pdf",
+                              "application/pdf")
+                )
+
+        assert result == "text"
+        poll_url = client.get.call_args[0][0]
+        assert poll_url == "https://example.com/check/1"
+
+
+# ---------------------------------------------------------------------------
+# LlamaParse config
+# ---------------------------------------------------------------------------
+
+class TestLlamaParseConfig:
+    """Verify the llamaparse API_PARSERS entry is correct."""
+
+    def test_llamaparse_uses_bearer_auth(self):
+        from petey.extract import API_PARSERS
+        cfg = API_PARSERS["llamaparse"]
+        assert cfg["auth_header"] == "Authorization"
+        assert cfg["auth_prefix"] == "Bearer"
+
+    def test_llamaparse_uses_poll_url_template(self):
+        from petey.extract import API_PARSERS
+        cfg = API_PARSERS["llamaparse"]
+        assert "poll_url_template" in cfg
+        assert "{id}" in cfg["poll_url_template"]
+        assert cfg["poll_check_key"] == "id"
+
+    def test_llamaparse_poll_done_value(self):
+        from petey.extract import API_PARSERS
+        cfg = API_PARSERS["llamaparse"]
+        assert cfg["poll_done_value"] == "SUCCESS"
+
+    def test_llamaparse_api_key_env(self):
+        from petey.extract import API_PARSERS
+        cfg = API_PARSERS["llamaparse"]
+        assert cfg["api_key_env"] == "LLAMA_CLOUD_API_KEY"
+
+
+# ---------------------------------------------------------------------------
+# Plugin registries
+# ---------------------------------------------------------------------------
+
+class TestPluginRegistries:
+    """Test the PLUGIN_* registries and lazy loader."""
+
+    def test_docling_in_plugin_parsers(self):
+        from petey.extract import PLUGIN_PARSERS
+        assert "docling" in PLUGIN_PARSERS
+        assert "docling" in PLUGIN_PARSERS["docling"]
+
+    def test_plugin_parsers_are_callable(self):
+        from petey.extract import PARSERS, PLUGIN_PARSERS
+        for name in PLUGIN_PARSERS:
+            assert callable(
+                PARSERS[name]
+            ), f"Plugin parser '{name}' should be callable"
+
+
+class TestPluginLoader:
+    """Test the _make_plugin_loader lazy import mechanism."""
+
+    def test_lazy_import_calls_function(self):
+        from petey.extract import _make_plugin_loader
+        loader = _make_plugin_loader("json:loads")
+        result = loader('{"a": 1}')
+        assert result == {"a": 1}
+
+    def test_bad_module_raises_at_build(self):
+        from petey.extract import _make_plugin_loader
+        with pytest.raises(ModuleNotFoundError):
+            _make_plugin_loader("nonexistent_module_xyz:func")
+
+    def test_bad_attr_raises_at_build(self):
+        from petey.extract import _make_plugin_loader
+        with pytest.raises(AttributeError):
+            _make_plugin_loader("json:nonexistent_function_xyz")

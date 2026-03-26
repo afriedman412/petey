@@ -180,10 +180,12 @@ All fields are nullable — Petey returns `null` for anything it can't find rath
 | `input` | Path to a PDF file or directory of PDFs. Overridden by CLI positional args. |
 | `output` | Output file path. Format inferred from extension (`.csv`, `.json`, `.jsonl`). Overridden by `-o`. Defaults to CSV for table mode, JSON for query mode. |
 | `mode: table` | Extract multiple records per page (default: `query` — one record per file). Accepts `record_type: array` for backwards compatibility. |
+| `model` | LLM model ID (e.g. `gpt-4.1-mini`, `claude-sonnet-4-6`). Overridden by `--model` or `PETEY_MODEL` env var. |
+| `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`, or `docling`. Overridden by `--parser`. |
+| `ocr` | OCR backend: `none` (default), `tesseract`, `mistral`, `chandra`. Overridden by `--ocr`. |
 | `instructions` | Extra guidance appended to the prompt (e.g. "ignore the summary row") |
 | `header_pages` | Number of leading pages to treat as a document header (see below) |
 | `pages` | Page range to process, e.g. `"2-5"` or `"1,3,5-7"` (1-indexed) |
-| `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`, or `docling` |
 
 ## Use Cases
 
@@ -283,11 +285,23 @@ petey extract --schema schema.yaml ./pdfs/ -o results.csv
 | `--concurrency / -c` | `10` | Number of concurrent API calls |
 | `--output / -o` | stdout | Output file path |
 | `--format / -f` | inferred | `csv`, `json`, or `jsonl` |
-| `--instructions / -i` | — | Extra extraction instructions |
-| `--parser` | `pymupdf` | Text extraction backend (`pymupdf`, `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`, `docling`) |
-| `--ocr` | `none` | OCR backend (`none`, `tesseract`, `mistral`, `chandra`) |
-| `--llm-backend / -b` | auto-detect | LLM backend (`openai`, `anthropic`, `litellm`) |
-| `--pages-per-chunk / -p` | `1` for arrays | Pages per LLM call (set to `0` to disable chunking) |
+| `--mode` | from schema | `query` (one record per file) or `table` (multiple records per page) |
+| `--query` | — | Shorthand for `--mode query` |
+| `--table` | — | Shorthand for `--mode table` |
+| `--parser` | from schema | Text extraction backend (`pymupdf`, `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`, `docling`) |
+| `--ocr` | from schema | OCR backend (`none`, `tesseract`, `mistral`, `chandra`) |
+| `--pages-per-chunk / -p` | `1` for tables | Pages per LLM call (set to `0` to disable chunking) |
+| `--header-pages` | from schema | Header pages to prepend to each chunk |
+| `--page-range` | from schema | Page range to extract (e.g. `2-5` or `1,3,5-7`) |
+
+To see all available backends:
+
+```bash
+petey list           # all backends
+petey list parsers   # just parsers
+petey list ocr       # just OCR
+petey list llm       # just LLM
+```
 
 ## Python API
 
@@ -307,8 +321,6 @@ result = extract(
     model="claude-sonnet-4-6",      # LLM model ID
     parser="pdfplumber",            # text extraction backend
     ocr_backend="mistral",          # OCR for scanned docs
-    llm_backend="litellm",          # explicit LLM backend
-    instructions="Ignore the watermark text",
 )
 ```
 
