@@ -1948,3 +1948,45 @@ class TestPluginLoader:
         from petey.extract import _make_plugin_loader
         with pytest.raises(AttributeError):
             _make_plugin_loader("json:nonexistent_function_xyz")
+
+
+# ---------------------------------------------------------------------------
+# parser_options / ocr_options passthrough
+# ---------------------------------------------------------------------------
+
+class TestBackendOptions:
+    """Verify parser_options and ocr_options reach the callable."""
+
+    def test_parser_options_passed(self):
+        mock_fn = MagicMock(return_value=["page text"])
+        with patch.dict(
+            "petey.extract.PARSERS", {"mock": mock_fn},
+        ):
+            extract_text_pages(
+                str(MCI_PDF), parser="mock",
+                parser_options={"lang": "fr", "dpi": 300},
+            )
+        mock_fn.assert_called_once()
+        _, kwargs = mock_fn.call_args
+        assert kwargs["lang"] == "fr"
+        assert kwargs["dpi"] == 300
+
+    def test_ocr_options_passed(self):
+        from petey.extract import OCR_THRESHOLD
+        mock_parser = MagicMock(return_value=["x"])
+        mock_ocr = MagicMock(return_value="ocr text")
+        with patch.dict(
+            "petey.extract.PARSERS", {"mock": mock_parser},
+        ):
+            with patch.dict(
+                "petey.extract.OCR_BACKENDS",
+                {"mock_ocr": mock_ocr},
+            ):
+                extract_text_pages(
+                    str(MCI_PDF), parser="mock",
+                    ocr_backend="mock_ocr",
+                    ocr_options={"languages": ["en", "fr"]},
+                )
+        mock_ocr.assert_called_once()
+        _, kwargs = mock_ocr.call_args
+        assert kwargs["languages"] == ["en", "fr"]

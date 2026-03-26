@@ -484,26 +484,26 @@ def extract_text(
     parser: str = "pymupdf",
     ocr_fallback: bool = False,
     ocr_backend: str = "none",
+    parser_options: dict | None = None,
+    ocr_options: dict | None = None,
 ) -> str:
     """Extract all text from a PDF as a single string.
 
     Args:
         pdf_path: Path to the PDF file.
-        parser: Text extraction backend.
-            "pymupdf"    — markdown via pymupdf4llm (default)
-            "tables"     — PyMuPDF table detection → TSV
-            "pdfplumber" — layout-preserving spatial extraction
-            "tabula"     — tabula-py table extraction → TSV (requires Java)
+        parser: Text extraction backend — see ``PARSERS`` registry.
         ocr_fallback: Deprecated. Use ``ocr_backend="tesseract"`` instead.
         ocr_backend: OCR fallback when text layer is empty/short.
-            "none"       — no OCR (default)
-            "tesseract"  — local pytesseract (requires tesseract binary)
-            "mistral"    — Mistral OCR API (requires MISTRAL_API_KEY)
+        parser_options: Extra kwargs passed to the parser callable.
+        ocr_options: Extra kwargs passed to the OCR callable.
 
     Returns:
         Extracted text as a single string.
     """
-    pages = extract_text_pages(pdf_path, parser, ocr_fallback, ocr_backend)
+    pages = extract_text_pages(
+        pdf_path, parser, ocr_fallback, ocr_backend,
+        parser_options=parser_options, ocr_options=ocr_options,
+    )
     return "\n\n".join(pages)
 
 
@@ -512,6 +512,8 @@ def extract_text_pages(
     parser: str = "pymupdf",
     ocr_fallback: bool = False,
     ocr_backend: str = "none",
+    parser_options: dict | None = None,
+    ocr_options: dict | None = None,
 ) -> list[str]:
     """Extract text from each page of a PDF separately.
 
@@ -521,11 +523,15 @@ def extract_text_pages(
         ocr_fallback: Deprecated. Use ``ocr_backend="tesseract"`` instead.
         ocr_backend: OCR fallback when text layer is empty/short —
             see ``OCR_BACKENDS`` registry.
+        parser_options: Extra kwargs passed to the parser callable.
+        ocr_options: Extra kwargs passed to the OCR callable.
 
     Returns:
         List of strings, one per page.
     """
     ocr_backend = _resolve_ocr_backend(ocr_fallback, ocr_backend)
+    _p_opts = parser_options or {}
+    _o_opts = ocr_options or {}
 
     fn = PARSERS.get(parser)
     if fn is None:
@@ -550,9 +556,9 @@ def extract_text_pages(
                 f"extract_async() or "
                 f"extract_pages_async() instead."
             )
-        pages = asyncio.run(fn(pdf_path))
+        pages = asyncio.run(fn(pdf_path, **_p_opts))
     else:
-        pages = fn(pdf_path)
+        pages = fn(pdf_path, **_p_opts)
 
     # Apply OCR fallback to pages with insufficient text
     if ocr_backend != "none":
@@ -561,7 +567,10 @@ def extract_text_pages(
             if len(text.strip()) < OCR_THRESHOLD:
                 if doc is None:
                     doc = fitz.open(pdf_path)
-                pages[i] = _ocr_page(doc[i], ocr_backend, pdf_path)
+                pages[i] = _ocr_page(
+                    doc[i], ocr_backend, pdf_path,
+                    **_o_opts,
+                )
 
     return pages
 
@@ -599,6 +608,7 @@ OCR_BACKENDS = {
 def _ocr_page(
     page, ocr_backend: str = "tesseract",
     pdf_path: str | None = None,
+    **ocr_options,
 ) -> str:
     """OCR a single fitz page.
 
@@ -606,6 +616,7 @@ def _ocr_page(
         page: A fitz page object.
         ocr_backend: OCR backend — see ``OCR_BACKENDS`` registry.
         pdf_path: Path to the source PDF (used by Mistral OCR).
+        **ocr_options: Extra kwargs passed to the OCR callable.
 
     Returns:
         Extracted text from the page.
@@ -627,8 +638,8 @@ def _ocr_page(
                 f"Use extract_async() or "
                 f"extract_pages_async() instead."
             )
-        return asyncio.run(fn(page))
-    return fn(page)
+        return asyncio.run(fn(page, **ocr_options))
+    return fn(page, **ocr_options)
 
 
 def _ocr_full(doc, pdf_path: str, ocr_backend: str) -> str:
@@ -831,6 +842,8 @@ async def extract_async(
     llm_backend: str | None = None,
     text: str | None = None,
     parse_fn=None,
+    parser_options: dict | None = None,
+    ocr_options: dict | None = None,
 ) -> BaseModel:
     """Extract structured data from a single PDF.
 
@@ -852,6 +865,7 @@ async def extract_async(
     Returns:
         Populated Pydantic model instance.
     """
+    _p_opts = parser_options or {}
     mgr = get_manager()
     if text is None:
         if parse_fn is not None:
@@ -866,13 +880,14 @@ async def extract_async(
                 parser_fn
             ):
                 pages = await mgr.run(
-                    parser_fn, pdf_path,
+                    parser_fn, pdf_path, **_p_opts,
                 )
                 text = "\n\n".join(pages)
             else:
                 text = await mgr.run_cpu(
                     extract_text, pdf_path, parser,
                     ocr_fallback, ocr_backend,
+                    _p_opts, ocr_options,
                 )
     if len(text) > TEXT_WARN_THRESHOLD:
         warnings.warn(
@@ -945,6 +960,8 @@ def extract(
     ocr_fallback: bool = False,
     ocr_backend: str = "none",
     llm_backend: str | None = None,
+    parser_options: dict | None = None,
+    ocr_options: dict | None = None,
 ) -> BaseModel:
     """Sync wrapper around ``extract_async``. See that function for args."""
     return asyncio.run(
@@ -953,6 +970,7 @@ def extract(
             model=model, api_key=api_key, instructions=instructions,
             parser=parser, ocr_fallback=ocr_fallback,
             ocr_backend=ocr_backend, llm_backend=llm_backend,
+            parser_options=parser_options, ocr_options=ocr_options,
         )
     )
 
@@ -1132,6 +1150,8 @@ async def extract_pages_async(
     page_range: str | None = None,
     parse_multiplier: int = 5,
     parse_fn=None,
+    parser_options: dict | None = None,
+    ocr_options: dict | None = None,
 ) -> list[dict]:
     """Split a PDF into page chunks and extract each concurrently.
 
@@ -1162,6 +1182,8 @@ async def extract_pages_async(
         parse_fn: Optional async callable(pdf_path, page_index, parser,
             ocr_backend) -> str. When provided, replaces local
             page-level text extraction (no ProcessPoolExecutor used).
+        parser_options: Extra kwargs passed to the parser callable.
+        ocr_options: Extra kwargs passed to the OCR callable.
 
     Returns:
         List of result dicts (with _page and optionally _error).
@@ -1174,6 +1196,8 @@ async def extract_pages_async(
             DeprecationWarning,
             stacklevel=2,
         )
+
+    _p_opts = parser_options or {}
 
     # Resolve parser from registry
     parser_fn = PARSERS.get(parser)
@@ -1210,11 +1234,11 @@ async def extract_pages_async(
         try:
             if parser_is_async:
                 h_pages = await mgr.run(
-                    parser_fn, h_path,
+                    parser_fn, h_path, **_p_opts,
                 )
             else:
                 h_pages = await mgr.run_cpu(
-                    parser_fn, h_path,
+                    parser_fn, h_path, **_p_opts,
                 )
             header_text = "\n\n".join(h_pages)
         finally:
@@ -1270,11 +1294,11 @@ async def extract_pages_async(
         try:
             if parser_is_async:
                 pages = await mgr.run(
-                    parser_fn, chunk_path,
+                    parser_fn, chunk_path, **_p_opts,
                 )
             else:
                 pages = await mgr.run_cpu(
-                    parser_fn, chunk_path,
+                    parser_fn, chunk_path, **_p_opts,
                 )
             return "\n\n".join(pages)
         finally:
@@ -1441,6 +1465,8 @@ async def extract_batch(
     ocr_backend: str = "none",
     llm_backend: str | None = None,
     parse_fn=None,
+    parser_options: dict | None = None,
+    ocr_options: dict | None = None,
 ) -> list[dict]:
     """Extract from multiple PDFs concurrently.
 
@@ -1460,11 +1486,14 @@ async def extract_batch(
         parse_fn: Optional async callable(pdf_path, parser,
             ocr_backend) -> str. When provided, replaces local
             text extraction.
+        parser_options: Extra kwargs passed to the parser callable.
+        ocr_options: Extra kwargs passed to the OCR callable.
 
     Returns:
         List of result dicts (with _source_file and optionally
         _error).
     """
+    _p_opts = parser_options or {}
     mgr = get_manager()
     mgr.configure(api_limit=concurrency)
     client = _make_client(model, api_key, llm_backend)
@@ -1484,13 +1513,14 @@ async def extract_batch(
                 )
             elif parser_is_async:
                 pages = await mgr.run(
-                    parser_fn, path,
+                    parser_fn, path, **_p_opts,
                 )
                 text = "\n\n".join(pages)
             else:
                 text = await mgr.run_cpu(
                     extract_text, path, parser,
                     ocr_fallback, ocr_backend,
+                    _p_opts, ocr_options,
                 )
             async with mgr.api():
                 result = (
