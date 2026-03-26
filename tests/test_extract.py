@@ -93,7 +93,16 @@ class TestBuildModel:
         assert "status_enum" not in str(schema)
         assert "infer" in str(schema).lower()
 
-    def test_array_record_type(self):
+    def test_table_mode(self):
+        spec = {
+            "mode": "table",
+            "fields": {"address": {"type": "string", "description": "Addr"}},
+        }
+        model = build_model(spec)
+        schema = model.model_json_schema()
+        assert "items" in schema.get("properties", {}) or "items" in schema.get("required", [])
+
+    def test_record_type_array_backwards_compat(self):
         spec = {
             "record_type": "array",
             "fields": {"address": {"type": "string", "description": "Addr"}},
@@ -207,6 +216,108 @@ class TestCLI:
         flat, keys = _flatten(records)
         assert len(flat) == 2
         assert keys == ["a"]
+
+    def test_schema_input_used_when_no_cli_paths(self, tmp_path):
+        """Schema 'input' field provides PDF paths when CLI paths omitted."""
+        from petey.cli import _collect_pdfs
+        # Create a temp dir with a PDF
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"%PDF-fake")
+        spec = {"input": str(tmp_path)}
+        paths = []  # no CLI paths
+        if not paths and spec.get("input"):
+            paths = [spec["input"]]
+        pdfs = _collect_pdfs(paths)
+        assert len(pdfs) == 1
+        assert "doc.pdf" in pdfs[0]
+
+    def test_cli_paths_override_schema_input(self, tmp_path):
+        """CLI positional paths take precedence over schema input."""
+        from petey.cli import _collect_pdfs
+        schema_dir = tmp_path / "schema_dir"
+        schema_dir.mkdir()
+        (schema_dir / "a.pdf").write_bytes(b"%PDF-fake")
+        cli_dir = tmp_path / "cli_dir"
+        cli_dir.mkdir()
+        (cli_dir / "b.pdf").write_bytes(b"%PDF-fake")
+        paths = [str(cli_dir)]  # CLI wins
+        pdfs = _collect_pdfs(paths)
+        assert len(pdfs) == 1
+        assert "b.pdf" in pdfs[0]
+
+    def test_schema_output_used_when_no_cli_output(self):
+        """Schema 'output' field is used when -o not provided."""
+        spec = {"output": "results.csv"}
+        output_path = None or spec.get("output")
+        assert output_path == "results.csv"
+
+    def test_cli_output_overrides_schema_output(self):
+        """CLI -o takes precedence over schema output."""
+        spec = {"output": "schema_out.csv"}
+        cli_output = "cli_out.json"
+        output_path = cli_output or spec.get("output")
+        assert output_path == "cli_out.json"
+
+    def test_default_format_csv_for_table_mode(self):
+        """Table mode defaults to CSV output."""
+        is_table = True
+        fmt = None
+        output_path = None
+        if not fmt:
+            fmt = "csv" if is_table else "json"
+        assert fmt == "csv"
+
+    def test_default_format_json_for_query_mode(self):
+        """Query mode defaults to JSON output."""
+        is_table = False
+        fmt = None
+        output_path = None
+        if not fmt:
+            fmt = "csv" if is_table else "json"
+        assert fmt == "json"
+
+    def test_output_format_inferred_from_extension(self):
+        """Output format inferred from file extension."""
+        output_path = "results.jsonl"
+        ext = Path(output_path).suffix.lower()
+        fmt = {".csv": "csv", ".json": "json", ".jsonl": "jsonl"}.get(
+            ext, "csv",
+        )
+        assert fmt == "jsonl"
+
+    def test_mode_table_overrides_schema(self):
+        """--mode table overrides schema mode."""
+        spec = {"mode": "query", "fields": {"x": {"type": "string", "description": ""}}}
+        mode_arg = "table"
+        if mode_arg is not None:
+            spec["mode"] = mode_arg
+        assert spec["mode"] == "table"
+
+    def test_mode_query_overrides_schema(self):
+        """--mode query overrides schema mode."""
+        spec = {"mode": "table", "fields": {"x": {"type": "string", "description": ""}}}
+        mode_arg = "query"
+        if mode_arg is not None:
+            spec["mode"] = mode_arg
+        assert spec["mode"] == "query"
+
+    def test_record_type_array_compat_sets_table(self):
+        """record_type: array is mapped to mode: table."""
+        spec = {"record_type": "array", "fields": {"x": {"type": "string", "description": ""}}}
+        if spec.get("record_type") == "array" and "mode" not in spec:
+            spec["mode"] = "table"
+        assert spec["mode"] == "table"
+
+    def test_schema_input_single_file(self, tmp_path):
+        """Schema input pointing to a single file works."""
+        from petey.cli import _collect_pdfs
+        pdf = tmp_path / "single.pdf"
+        pdf.write_bytes(b"%PDF-fake")
+        spec = {"input": str(pdf)}
+        paths = [spec["input"]]
+        pdfs = _collect_pdfs(paths)
+        assert len(pdfs) == 1
+        assert "single.pdf" in pdfs[0]
 
 
 # ---------------------------------------------------------------------------

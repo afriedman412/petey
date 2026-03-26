@@ -183,6 +183,9 @@ def _extract_text_pages_tabula(pdf_path: str) -> list[str]:
 #   poll_status_key — key to check for completion (default: "status")
 #   poll_done_value — value that means done (default: "complete")
 #   poll_check_key  — key containing the poll URL (default: "request_check_url")
+#   poll_url_template — build poll URL from check_key value via str.format()
+#                       e.g. "https://api.example.com/job/{id}/result"
+#                       when set, poll_check_key is the value to interpolate
 #   timeout        — max seconds to wait for poll (default: 240)
 
 API_PARSERS: dict[str, dict] = {
@@ -193,6 +196,21 @@ API_PARSERS: dict[str, dict] = {
         "params": {"output_format": "markdown"},
         "response_key": "markdown",
         "poll": True,
+    },
+    "llamaparse": {
+        "endpoint": "https://api.cloud.llamaindex.ai/api/parsing/upload",
+        "api_key_env": "LLAMA_CLOUD_API_KEY",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer",
+        "response_key": "markdown",
+        "poll": True,
+        "poll_check_key": "id",
+        "poll_url_template": (
+            "https://api.cloud.llamaindex.ai"
+            "/api/parsing/job/{id}/result/markdown"
+        ),
+        "poll_status_key": "status",
+        "poll_done_value": "SUCCESS",
     },
 }
 
@@ -291,7 +309,19 @@ async def _api_post(
             )
             timeout = cfg.get("timeout", 240)
             poll_interval = 2
-            check_url = result.get(check_key)
+            poll_url_template = cfg.get("poll_url_template")
+            if poll_url_template:
+                check_value = result.get(check_key)
+                if not check_value:
+                    raise ValueError(
+                        f"API at {endpoint} "
+                        f"did not return '{check_key}'"
+                    )
+                check_url = poll_url_template.format(
+                    **{check_key: check_value},
+                )
+            else:
+                check_url = result.get(check_key)
             if not check_url:
                 raise ValueError(
                     f"API at {endpoint} "
@@ -871,7 +901,7 @@ INFER_SCHEMA_SYSTEM = (
     "Return valid JSON with this structure:\n"
     "{\n"
     '  "name": "short_snake_case_name",\n'
-    '  "record_type": "single" or "array",\n'
+    '  "mode": "query" or "table",\n'
     '  "instructions": "brief notes about the document format",\n'
     '  "fields": {\n'
     '    "field_name": {\n'
@@ -882,8 +912,8 @@ INFER_SCHEMA_SYSTEM = (
     "  }\n"
     "}\n\n"
     "Guidelines:\n"
-    "- Use array record_type for repeating rows/records\n"
-    "- Use single if the document has one set of fields\n"
+    "- Use table mode for repeating rows/records\n"
+    "- Use query mode if the document has one set of fields\n"
     "- Use enum when values come from a fixed set\n"
     "- Use date for dates, number for numbers, string otherwise\n"
     "- Keep field names short, lowercase, snake_case\n"

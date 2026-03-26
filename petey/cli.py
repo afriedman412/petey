@@ -21,6 +21,7 @@ import yaml
 from petey.schema import load_schema
 from petey.extract import (
     extract_batch, extract_pages_async, infer_schema,
+    PARSERS, OCR_BACKENDS, LLM_BACKENDS,
 )
 
 
@@ -78,7 +79,10 @@ def main():
     sub = parser.add_subparsers(dest="command")
 
     ext = sub.add_parser("extract", help="Extract data from PDFs")
-    ext.add_argument("paths", nargs="+", help="PDF files or directories")
+    ext.add_argument(
+        "paths", nargs="*",
+        help="PDF files or directories (overrides input in schema)",
+    )
     ext.add_argument("--schema", "-s", required=True, help="YAML schema file")
     ext.add_argument(
         "--model", "-m", default=None,
@@ -106,7 +110,7 @@ def main():
     )
     ext.add_argument(
         "--parser", default="pymupdf",
-        choices=["pymupdf", "tables", "pdfplumber", "tabula"],
+        choices=list(PARSERS.keys()),
         help=(
             "PDF text extraction backend (default: pymupdf; "
             "array schemas default to tables)"
@@ -118,7 +122,7 @@ def main():
     )
     ext.add_argument(
         "--ocr", dest="ocr_backend", default="none",
-        choices=["none", "tesseract", "mistral"],
+        choices=["none"] + [k for k in OCR_BACKENDS if k != "none"],
         help=(
             "OCR backend for scanned pages "
             "(default: none)"
@@ -126,10 +130,27 @@ def main():
     )
     ext.add_argument(
         "--llm-backend", "-b", default=None,
-        choices=["openai", "anthropic", "litellm"],
+        choices=list(LLM_BACKENDS.keys()),
         help=(
             "LLM backend (default: auto-detect from model name)"
         ),
+    )
+    mode_group = ext.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--mode", choices=["query", "table"], default=None,
+        help=(
+            "Extraction mode: query (one record per file) "
+            "or table (multiple records per page). "
+            "Overrides mode in the schema."
+        ),
+    )
+    mode_group.add_argument(
+        "--query", action="store_const", const="query", dest="mode",
+        help="Shorthand for --mode query",
+    )
+    mode_group.add_argument(
+        "--table", action="store_const", const="table", dest="mode",
+        help="Shorthand for --mode table",
     )
     ext.add_argument(
         "--header-pages", type=int, default=None,
@@ -156,12 +177,12 @@ def main():
     )
     inf.add_argument(
         "--parser", default="pymupdf",
-        choices=["pymupdf", "tables", "pdfplumber", "tabula"],
+        choices=list(PARSERS.keys()),
         help="PDF text extraction backend",
     )
     inf.add_argument(
         "--ocr", dest="ocr_backend", default="none",
-        choices=["none", "tesseract", "mistral"],
+        choices=["none"] + [k for k in OCR_BACKENDS if k != "none"],
         help="OCR backend for scanned pages",
     )
     inf.add_argument(
@@ -170,7 +191,7 @@ def main():
     )
     inf.add_argument(
         "--llm-backend", "-b", default=None,
-        choices=["openai", "anthropic", "litellm"],
+        choices=list(LLM_BACKENDS.keys()),
         help="LLM backend override",
     )
 
@@ -188,29 +209,51 @@ def main():
 
 def run_extract(args):
     response_model, spec = load_schema(args.schema)
-    pdfs = _collect_pdfs(args.paths)
+
+    # Input: CLI paths override schema input
+    paths = args.paths or []
+    if not paths and spec.get("input"):
+        paths = [spec["input"]]
+    if not paths:
+        print(
+            "No input specified. Provide paths on the command line "
+            "or set 'input:' in the schema.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    pdfs = _collect_pdfs(paths)
 
     if not pdfs:
         print("No PDF files found.", file=sys.stderr)
         sys.exit(1)
 
     model = args.model or os.environ.get("PETEY_MODEL", "gpt-4.1-mini")
-    is_array = spec.get("record_type") == "array"
+
+    # CLI --mode / --table / --query overrides schema mode
+    if args.mode is not None:
+        spec["mode"] = args.mode
+    # Backwards compat: record_type: array → mode: table
+    if spec.get("record_type") == "array" and "mode" not in spec:
+        spec["mode"] = "table"
+    is_table = spec.get("mode") == "table"
+
+    # Output: CLI -o overrides schema output
+    output_path = args.output or spec.get("output")
 
     # Determine output format
     fmt = args.format
-    if not fmt and args.output:
-        ext = Path(args.output).suffix.lower()
+    if not fmt and output_path:
+        ext = Path(output_path).suffix.lower()
         fmt = {".csv": "csv", ".json": "json", ".jsonl": "jsonl"}.get(
-            ext, "jsonl"
+            ext, "csv" if is_table else "json",
         )
     if not fmt:
-        fmt = "jsonl"
+        fmt = "csv" if is_table else "json"
 
     # Streaming output for jsonl when writing to stdout
     out_file = None
-    if fmt == "jsonl" and args.output:
-        out_file = open(args.output, "w")
+    if fmt == "jsonl" and output_path:
+        out_file = open(output_path, "w")
 
     completed = 0
     total = len(pdfs)
@@ -245,11 +288,11 @@ def run_extract(args):
     if args.parser != "pymupdf":
         parser = args.parser
     else:
-        parser = spec.get("parser", "tables" if is_array else "pymupdf")
+        parser = spec.get("parser", "tables" if is_table else "pymupdf")
 
     # Auto-chunk by page for array/table schemas unless explicitly disabled
     pages_per_chunk = args.pages_per_chunk
-    if pages_per_chunk is None and is_array:
+    if pages_per_chunk is None and is_table:
         pages_per_chunk = 1
 
     # Build a summary of non-default options for status messages
@@ -355,7 +398,7 @@ def run_extract(args):
     # Unwrap array results
     all_records = []
     for data in results:
-        if is_array and "items" in data:
+        if is_table and "items" in data:
             for item in data["items"]:
                 item["_source_file"] = data.get("_source_file", "")
                 if "_page" in data:
@@ -366,13 +409,13 @@ def run_extract(args):
 
     if fmt == "csv":
         flat, keys = _flatten(all_records)
-        if args.output:
-            with open(args.output, "w", newline="") as f:
+        if output_path:
+            with open(output_path, "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
                 w.writeheader()
                 w.writerows(flat)
             print(
-                f"Wrote {len(flat)} rows to {args.output}", file=sys.stderr
+                f"Wrote {len(flat)} rows to {output_path}", file=sys.stderr
             )
         else:
             w = csv.DictWriter(
@@ -381,16 +424,16 @@ def run_extract(args):
             w.writeheader()
             w.writerows(flat)
     elif fmt == "json":
-        output = json.dumps(all_records, indent=2)
-        if args.output:
-            Path(args.output).write_text(output)
+        json_output = json.dumps(all_records, indent=2)
+        if output_path:
+            Path(output_path).write_text(json_output)
             print(
-                f"Wrote {len(all_records)} records to {args.output}",
+                f"Wrote {len(all_records)} records to {output_path}",
                 file=sys.stderr,
             )
         else:
-            print(output)
-    elif fmt == "jsonl" and not args.output:
+            print(json_output)
+    elif fmt == "jsonl" and not output_path:
         pass  # Already streamed in on_result
 
     print(
@@ -434,10 +477,10 @@ def run_infer_schema(args):
         print(output)
 
     n_fields = len(spec.get("fields", {}))
-    rtype = spec.get("record_type", "single")
+    mode = spec.get("mode", "query")
     print(
         f"Suggested {n_fields} fields "
-        f"(record_type: {rtype})",
+        f"(mode: {mode})",
         file=sys.stderr,
     )
 

@@ -57,7 +57,7 @@ def build_model(spec: dict) -> type[BaseModel]:
         **field_definitions,
     )
 
-    if spec.get("record_type") == "array":
+    if spec.get("mode") == "table" or spec.get("record_type") == "array":
         model = create_model(
             model_name + "List",
             items=(

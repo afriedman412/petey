@@ -30,6 +30,7 @@ The first step is getting text out of the PDF. Different extractors work better 
 | `pdfplumber` | included | Borderless tables | Layout-preserving extraction that positions text spatially. Good for documents where columns are aligned by whitespace rather than cell borders. |
 | `tabula` | `pip install petey[tabula]` | Structured tables | Uses tabula-py (Java-based) to detect and extract tables as DataFrames. Falls back to pymupdf for pages without tables. Requires Java. |
 | `marker` | included | Complex layouts | Remote API via Datalab. Requires `DATALAB_API_KEY`. |
+| `llamaparse` | included | Complex layouts | Remote API via LlamaCloud. Requires `LLAMA_CLOUD_API_KEY`. |
 
 Parsers are registered in the `PARSERS` dict. Local parsers are sync functions; API parsers (like `marker`) are async and automatically routed through the API concurrency pool. To add a new API parser, add an entry to `API_PARSERS` — no new code needed.
 
@@ -166,11 +167,13 @@ All fields are nullable — Petey returns `null` for anything it can't find rath
 
 | Option | Description |
 |--------|-------------|
-| `record_type: array` | Extract multiple records per document instead of one |
+| `input` | Path to a PDF file or directory of PDFs. Overridden by CLI positional args. |
+| `output` | Output file path. Format inferred from extension (`.csv`, `.json`, `.jsonl`). Overridden by `-o`. Defaults to CSV for table mode, JSON for query mode. |
+| `mode: table` | Extract multiple records per page (default: `query` — one record per file). Accepts `record_type: array` for backwards compatibility. |
 | `instructions` | Extra guidance appended to the prompt (e.g. "ignore the summary row") |
 | `header_pages` | Number of leading pages to treat as a document header (see below) |
 | `pages` | Page range to process, e.g. `"2-5"` or `"1,3,5-7"` (1-indexed) |
-| `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, `tabula`, or `marker` |
+| `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, `tabula`, `marker`, or `llamaparse` |
 
 ## Use Cases
 
@@ -203,13 +206,13 @@ petey extract --schema invoice.yaml ./invoices/ -o results.csv
 
 ### One table per file
 
-Some documents contain a table of records — a bank statement, a schedule of assets, a list of transactions. Add `record_type: array` and Petey will return multiple rows per file. Petey splits the document into pages, processes each concurrently, and assembles the results in document order.
+Some documents contain a table of records — a bank statement, a schedule of assets, a list of transactions. Add `mode: table` and Petey will return multiple rows per file. Petey splits the document into pages, processes each concurrently, and assembles the results in document order.
 
 Documents like this often have important context on the first page — a header, column labels, the filer's name. The `header_pages` option tells Petey to prepend those pages to every page it sends to the LLM, so that context is always visible no matter how deep into the document it's looking.
 
 ```yaml
 name: Transactions
-record_type: array
+mode: table
 header_pages: 1
 fields:
   date:
@@ -271,7 +274,7 @@ petey extract --schema schema.yaml ./pdfs/ -o results.csv
 | `--output / -o` | stdout | Output file path |
 | `--format / -f` | inferred | `csv`, `json`, or `jsonl` |
 | `--instructions / -i` | — | Extra extraction instructions |
-| `--parser` | `pymupdf` | Text extraction backend (`pymupdf`, `tables`, `pdfplumber`, `tabula`, `marker`) |
+| `--parser` | `pymupdf` | Text extraction backend (`pymupdf`, `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`) |
 | `--ocr` | `none` | OCR backend (`none`, `tesseract`, `mistral`, `chandra`) |
 | `--llm-backend / -b` | auto-detect | LLM backend (`openai`, `anthropic`, `litellm`) |
 | `--pages-per-chunk / -p` | `1` for arrays | Pages per LLM call (set to `0` to disable chunking) |
