@@ -187,7 +187,21 @@ def _extract_text_pages_tabula(pdf_path: str) -> list[str]:
 #   poll_url_template — build poll URL from check_key value via str.format()
 #                       e.g. "https://api.example.com/job/{id}/result"
 #                       when set, poll_check_key is the value to interpolate
+#   poll_header_key — read the poll URL from a response header instead
+#                     of the JSON body (e.g. "Operation-Location" for Azure)
+#   endpoint_env   — env var containing the base URL (for per-user endpoints)
+#   endpoint_suffix — path appended to endpoint_env value
 #   timeout        — max seconds to wait for poll (default: 240)
+#
+# request_format options:
+#   "multipart"  — standard multipart/form-data file upload (default)
+#   "json_b64"   — base64-encoded file in a JSON body
+#   "raw"        — raw file bytes with Content-Type header
+#
+# response_key patterns:
+#   "markdown"    — simple top-level key
+#   "result.text" — dot-separated nested key
+#   "[].text"     — join text from each element in an array response
 
 API_PARSERS: dict[str, dict] = {
     "marker": {
@@ -199,6 +213,35 @@ API_PARSERS: dict[str, dict] = {
         "params": {"output_format": "markdown"},
         "response_key": "markdown",
         "poll": True,
+    },
+    "unstructured_api": {
+        "name": "Unstructured API",
+        "role": "parser",
+        "endpoint": "https://api.unstructuredapp.io/general/v0/general",
+        "api_key_env": "UNSTRUCTURED_API_KEY",
+        "auth_header": "unstructured-api-key",
+        "params": {"strategy": "auto"},
+        "response_key": "[].text",
+        "poll": False,
+    },
+    "azure_documentai": {
+        "name": "Azure Document Intelligence",
+        "role": "parser",
+        "endpoint_env": "AZURE_DOCUMENT_ENDPOINT",
+        "endpoint_suffix": (
+            "/documentintelligence"
+            "/documentModels/prebuilt-read:analyze"
+            "?api-version=2024-11-30"
+        ),
+        "api_key_env": "AZURE_DOCUMENT_KEY",
+        "auth_header": "Ocp-Apim-Subscription-Key",
+        "request_format": "raw",
+        "response_key": "analyzeResult.content",
+        "poll": True,
+        "poll_header_key": "Operation-Location",
+        "poll_status_key": "status",
+        "poll_done_value": "succeeded",
+        "timeout": 120,
     },
     "llamaparse": {
         "name": "LlamaParse",
@@ -230,15 +273,35 @@ API_OCR_BACKENDS: dict[str, dict] = {
         "response_key": "markdown",
         "poll": True,
     },
+    "surya": {
+        "name": "Surya",
+        "role": "ocr",
+        "endpoint": "https://www.datalab.to/api/v1/ocr",
+        "api_key_env": "DATALAB_API_KEY",
+        "auth_header": "X-API-Key",
+        "response_key": "text",
+        "poll": True,
+    },
 }
 
 
-def _resolve_response(data: dict, key_path: str) -> str:
-    """Extract a value from a nested dict using a dot-separated path.
+def _resolve_response(data, key_path: str) -> str:
+    """Extract text from an API response.
 
     ``"markdown"`` → ``data["markdown"]``
     ``"result.text"`` → ``data["result"]["text"]``
+    ``"[].text"``  → join ``item["text"]`` from a list of dicts
     """
+    # Handle array responses: [].key joins text from each element
+    if key_path.startswith("[]."):
+        inner_key = key_path[3:]
+        if isinstance(data, list):
+            parts = [
+                str(item.get(inner_key, ""))
+                for item in data if isinstance(item, dict)
+            ]
+            return "\n\n".join(p for p in parts if p)
+        return ""
     obj = data
     for part in key_path.split("."):
         if isinstance(obj, dict):
@@ -269,7 +332,18 @@ async def _api_post(
     """
     api_key = _api_get_key(cfg)
     headers = _build_auth_header(cfg, api_key)
-    endpoint = cfg["endpoint"]
+    if "endpoint_env" in cfg:
+        base = os.environ.get(cfg["endpoint_env"], "")
+        if not base:
+            raise ValueError(
+                f"{cfg['endpoint_env']} environment variable "
+                f"is required for {cfg.get('name', 'backend')}."
+            )
+        endpoint = base.rstrip("/") + cfg.get(
+            "endpoint_suffix", "",
+        )
+    else:
+        endpoint = cfg["endpoint"]
     params = cfg.get("params", {})
     request_format = cfg.get("request_format", "multipart")
     file_field = cfg.get("file_field", "file")
@@ -289,6 +363,13 @@ async def _api_post(
                 content=json.dumps(payload),
                 headers=headers,
             )
+        elif request_format == "raw":
+            headers["Content-Type"] = content_type
+            resp = await client.post(
+                endpoint,
+                content=file_bytes,
+                headers=headers,
+            )
         else:  # multipart (default)
             resp = await client.post(
                 endpoint,
@@ -302,7 +383,9 @@ async def _api_post(
             )
 
         resp.raise_for_status()
-        result = resp.json()
+        result = resp.json() if resp.headers.get(
+            "content-type", "",
+        ).startswith("application/json") else {}
 
         response_key = cfg.get("response_key", "markdown")
 
@@ -316,8 +399,13 @@ async def _api_post(
             )
             timeout = cfg.get("timeout", 240)
             poll_interval = 2
+            # poll_header_key: read the poll URL from a
+            # response header instead of the JSON body
+            poll_header_key = cfg.get("poll_header_key")
             poll_url_template = cfg.get("poll_url_template")
-            if poll_url_template:
+            if poll_header_key:
+                check_url = resp.headers.get(poll_header_key)
+            elif poll_url_template:
                 check_value = result.get(check_key)
                 if not check_value:
                     raise ValueError(
@@ -408,13 +496,11 @@ PLUGIN_PARSERS: dict[str, str] = {
     "unstructured": "petey.plugins.unstructured:extract_pages",
     "textract": "petey.plugins.textract:extract_pages",
     "google_documentai": "petey.plugins.google_documentai:extract_pages",
-    "azure_documentai": "petey.plugins.azure_documentai:extract_pages",
 }
 
 PLUGIN_OCR_BACKENDS: dict[str, str] = {
     "mistral": "petey.plugins.mistral_ocr:ocr_page",
     "easyocr": "petey.plugins.easyocr_backend:ocr_page",
-    "surya": "petey.plugins.surya_ocr:ocr_page",
     "paddleocr": "petey.plugins.paddleocr_backend:ocr_page",
     "google_vision": "petey.plugins.google_vision_ocr:ocr_page",
 }

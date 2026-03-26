@@ -1038,13 +1038,15 @@ class TestRegistries:
     def test_api_parsers_config_valid(self):
         from petey.extract import API_PARSERS
         for name, cfg in API_PARSERS.items():
-            assert "endpoint" in cfg, f"{name} missing endpoint"
+            has_endpoint = "endpoint" in cfg or "endpoint_env" in cfg
+            assert has_endpoint, f"{name} missing endpoint/endpoint_env"
             assert "api_key_env" in cfg, f"{name} missing api_key_env"
 
     def test_api_ocr_config_valid(self):
         from petey.extract import API_OCR_BACKENDS
         for name, cfg in API_OCR_BACKENDS.items():
-            assert "endpoint" in cfg, f"{name} missing endpoint"
+            has_endpoint = "endpoint" in cfg or "endpoint_env" in cfg
+            assert has_endpoint, f"{name} missing endpoint/endpoint_env"
             assert "api_key_env" in cfg, f"{name} missing api_key_env"
 
     def test_api_parsers_are_callable(self):
