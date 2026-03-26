@@ -283,6 +283,8 @@ def run_extract(args):
                 print(line)
 
     instructions = spec.get("instructions", "")
+    parser_options = spec.get("parser_options") or None
+    ocr_options = spec.get("ocr_options") or None
 
     # CLI overrides schema, schema overrides defaults
     ocr_backend = (
@@ -362,6 +364,8 @@ def run_extract(args):
                     on_result=on_chunk,
                     parser=parser,
                     ocr_backend=ocr_backend,
+                    parser_options=parser_options,
+                    ocr_options=ocr_options,
                     header_pages=(
                         args.header_pages
                         if args.header_pages is not None
@@ -393,6 +397,8 @@ def run_extract(args):
                 on_result=on_result,
                 parser=parser,
                 ocr_backend=ocr_backend,
+                parser_options=parser_options,
+                ocr_options=ocr_options,
             )
         )
 

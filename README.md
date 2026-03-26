@@ -183,6 +183,8 @@ All fields are nullable — Petey returns `null` for anything it can't find rath
 | `model` | LLM model ID (e.g. `gpt-4.1-mini`, `claude-sonnet-4-6`). Overridden by `--model` or `PETEY_MODEL` env var. |
 | `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`, or `docling`. Overridden by `--parser`. |
 | `ocr` | OCR backend: `none` (default), `tesseract`, `mistral`, `chandra`. Overridden by `--ocr`. |
+| `parser_options` | Dict of extra kwargs passed to the parser (e.g. `languages: [en, fr]`) |
+| `ocr_options` | Dict of extra kwargs passed to the OCR backend |
 | `instructions` | Extra guidance appended to the prompt (e.g. "ignore the summary row") |
 | `header_pages` | Number of leading pages to treat as a document header (see below) |
 | `pages` | Page range to process, e.g. `"2-5"` or `"1,3,5-7"` (1-indexed) |
