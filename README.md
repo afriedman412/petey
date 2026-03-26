@@ -31,8 +31,9 @@ The first step is getting text out of the PDF. Different extractors work better 
 | `tabula` | `pip install petey[tabula]` | Structured tables | Uses tabula-py (Java-based) to detect and extract tables as DataFrames. Falls back to pymupdf for pages without tables. Requires Java. |
 | `marker` | included | Complex layouts | Remote API via Datalab. Requires `DATALAB_API_KEY`. |
 | `llamaparse` | included | Complex layouts | Remote API via LlamaCloud. Requires `LLAMA_CLOUD_API_KEY`. |
+| `docling` | `pip install docling` | Complex layouts | Local conversion via IBM Docling. No API key needed. |
 
-Parsers are registered in the `PARSERS` dict. Local parsers are sync functions; API parsers (like `marker`) are async and automatically routed through the API concurrency pool. To add a new API parser, add an entry to `API_PARSERS` — no new code needed.
+Parsers are registered in the `PARSERS` dict. Local parsers are sync functions; API parsers (like `marker`) are async and automatically routed through the API concurrency pool. To add a new API parser, add an entry to `API_PARSERS` — no new code needed. To add a new local parser, add an entry to `PLUGIN_PARSERS` with a `"module:callable"` path — the dependency is lazy-imported on first use.
 
 ### OCR Backends
 
@@ -89,6 +90,15 @@ API_LLM_BACKENDS["my_llm"] = {
 ```
 
 API parser and OCR backends are automatically async and route through the API concurrency pool.
+
+For local parsers that need a third-party package, use `PLUGIN_PARSERS` — the dependency is lazy-imported only when the parser is selected:
+
+```python
+from petey.extract import PLUGIN_PARSERS
+
+PLUGIN_PARSERS["my_parser"] = "my_package.pdf:extract_pages"
+# callable signature: (pdf_path: str) -> list[str]  (one string per page)
+```
 
 ### Concurrency
 
@@ -173,7 +183,7 @@ All fields are nullable — Petey returns `null` for anything it can't find rath
 | `instructions` | Extra guidance appended to the prompt (e.g. "ignore the summary row") |
 | `header_pages` | Number of leading pages to treat as a document header (see below) |
 | `pages` | Page range to process, e.g. `"2-5"` or `"1,3,5-7"` (1-indexed) |
-| `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, `tabula`, `marker`, or `llamaparse` |
+| `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`, or `docling` |
 
 ## Use Cases
 
@@ -274,7 +284,7 @@ petey extract --schema schema.yaml ./pdfs/ -o results.csv
 | `--output / -o` | stdout | Output file path |
 | `--format / -f` | inferred | `csv`, `json`, or `jsonl` |
 | `--instructions / -i` | — | Extra extraction instructions |
-| `--parser` | `pymupdf` | Text extraction backend (`pymupdf`, `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`) |
+| `--parser` | `pymupdf` | Text extraction backend (`pymupdf`, `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`, `docling`) |
 | `--ocr` | `none` | OCR backend (`none`, `tesseract`, `mistral`, `chandra`) |
 | `--llm-backend / -b` | auto-detect | LLM backend (`openai`, `anthropic`, `litellm`) |
 | `--pages-per-chunk / -p` | `1` for arrays | Pages per LLM call (set to `0` to disable chunking) |
