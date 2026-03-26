@@ -22,6 +22,8 @@ from petey.schema import load_schema
 from petey.extract import (
     extract_batch, extract_pages_async, infer_schema,
     PARSERS, OCR_BACKENDS, LLM_BACKENDS,
+    API_PARSERS, API_OCR_BACKENDS, PLUGIN_PARSERS,
+    PLUGIN_OCR_BACKENDS, PLUGIN_LLM_BACKENDS,
 )
 
 
@@ -101,19 +103,16 @@ def main():
         help="Output format (inferred from -o extension if not set)",
     )
     ext.add_argument(
-        "--instructions", "-i", default="",
-        help="Additional extraction instructions",
-    )
-    ext.add_argument(
         "--pages-per-chunk", "-p", type=int, default=None,
         help="Pages per chunk (default: 1 for table schemas, 0 to disable)",
     )
     ext.add_argument(
-        "--parser", default="pymupdf",
+        "--parser", default=None,
         choices=list(PARSERS.keys()),
         help=(
-            "PDF text extraction backend (default: pymupdf; "
-            "array schemas default to tables)"
+            "PDF text extraction backend "
+            "(default: from schema, or pymupdf; "
+            "table schemas default to tables)"
         ),
     )
     ext.add_argument(
@@ -121,18 +120,11 @@ def main():
         help="Deprecated. Use --ocr tesseract instead.",
     )
     ext.add_argument(
-        "--ocr", dest="ocr_backend", default="none",
+        "--ocr", dest="ocr_backend", default=None,
         choices=["none"] + [k for k in OCR_BACKENDS if k != "none"],
         help=(
             "OCR backend for scanned pages "
-            "(default: none)"
-        ),
-    )
-    ext.add_argument(
-        "--llm-backend", "-b", default=None,
-        choices=list(LLM_BACKENDS.keys()),
-        help=(
-            "LLM backend (default: auto-detect from model name)"
+            "(default: from schema, or none)"
         ),
     )
     mode_group = ext.add_mutually_exclusive_group()
@@ -189,10 +181,16 @@ def main():
         "--output", "-o", default=None,
         help="Save schema to YAML file",
     )
-    inf.add_argument(
-        "--llm-backend", "-b", default=None,
-        choices=list(LLM_BACKENDS.keys()),
-        help="LLM backend override",
+
+    # --- list subcommand ---
+    lst = sub.add_parser(
+        "list",
+        help="List available backends",
+    )
+    lst.add_argument(
+        "backend", nargs="?", default="all",
+        choices=["all", "parsers", "ocr", "llm"],
+        help="Which backends to list (default: all)",
     )
 
     args = parser.parse_args()
@@ -205,6 +203,8 @@ def main():
         run_extract(args)
     elif args.command == "infer-schema":
         run_infer_schema(args)
+    elif args.command == "list":
+        run_list(args)
 
 
 def run_extract(args):
@@ -227,7 +227,11 @@ def run_extract(args):
         print("No PDF files found.", file=sys.stderr)
         sys.exit(1)
 
-    model = args.model or os.environ.get("PETEY_MODEL", "gpt-4.1-mini")
+    model = (
+        args.model
+        or spec.get("model")
+        or os.environ.get("PETEY_MODEL", "gpt-4.1-mini")
+    )
 
     # CLI --mode / --table / --query overrides schema mode
     if args.mode is not None:
@@ -278,14 +282,18 @@ def run_extract(args):
             else:
                 print(line)
 
-    instructions = args.instructions or spec.get("instructions", "")
-    ocr_backend = args.ocr_backend
-    if args.ocr_fallback and ocr_backend == "none":
-        ocr_backend = "tesseract"
-    llm_backend = args.llm_backend
+    instructions = spec.get("instructions", "")
 
-    # Use "tables" parser by default for array schemas; allow explicit override
-    if args.parser != "pymupdf":
+    # CLI overrides schema, schema overrides defaults
+    ocr_backend = (
+        args.ocr_backend
+        or spec.get("ocr")
+        or ("tesseract" if args.ocr_fallback else "none")
+    )
+
+    # Parser: CLI overrides schema; schema overrides default;
+    # table schemas default to "tables", query schemas to "pymupdf"
+    if args.parser is not None:
         parser = args.parser
     else:
         parser = spec.get("parser", "tables" if is_table else "pymupdf")
@@ -301,8 +309,6 @@ def run_extract(args):
         extras.append(f"parser={parser}")
     if ocr_backend != "none":
         extras.append(f"ocr={ocr_backend}")
-    if llm_backend:
-        extras.append(f"backend={llm_backend}")
     opts = f"concurrency={args.concurrency}"
     if extras:
         opts = ", ".join(extras) + ", " + opts
@@ -356,7 +362,6 @@ def run_extract(args):
                     on_result=on_chunk,
                     parser=parser,
                     ocr_backend=ocr_backend,
-                    llm_backend=llm_backend,
                     header_pages=(
                         args.header_pages
                         if args.header_pages is not None
@@ -386,9 +391,8 @@ def run_extract(args):
                 instructions=instructions,
                 concurrency=args.concurrency,
                 on_result=on_result,
-                parser=args.parser,
+                parser=parser,
                 ocr_backend=ocr_backend,
-                llm_backend=llm_backend,
             )
         )
 
@@ -459,7 +463,6 @@ def run_infer_schema(args):
         model=model,
         parser=args.parser,
         ocr_backend=args.ocr_backend,
-        llm_backend=args.llm_backend,
         max_pages=args.max_pages,
     )
 
@@ -483,6 +486,34 @@ def run_infer_schema(args):
         f"(mode: {mode})",
         file=sys.stderr,
     )
+
+
+def _backend_type(name, api_dict, plugin_dict):
+    """Classify a backend as built-in, API, or plugin."""
+    if name in plugin_dict:
+        return "plugin"
+    if name in api_dict:
+        return "api"
+    return "built-in"
+
+
+def run_list(args):
+    sections = {
+        "parsers": (PARSERS, API_PARSERS, PLUGIN_PARSERS),
+        "ocr": (OCR_BACKENDS, API_OCR_BACKENDS, PLUGIN_OCR_BACKENDS),
+        "llm": (LLM_BACKENDS, {}, PLUGIN_LLM_BACKENDS),
+    }
+    show = (
+        list(sections.keys()) if args.backend == "all"
+        else [args.backend]
+    )
+    for section in show:
+        registry, api_dict, plugin_dict = sections[section]
+        print(f"\n{section}:")
+        for name in registry:
+            kind = _backend_type(name, api_dict, plugin_dict)
+            print(f"  {name:20s} ({kind})")
+    print()
 
 
 if __name__ == "__main__":

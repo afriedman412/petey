@@ -191,6 +191,8 @@ def _extract_text_pages_tabula(pdf_path: str) -> list[str]:
 
 API_PARSERS: dict[str, dict] = {
     "marker": {
+        "name": "Marker",
+        "role": "parser",
         "endpoint": "https://www.datalab.to/api/v1/marker",
         "api_key_env": "DATALAB_API_KEY",
         "auth_header": "X-API-Key",
@@ -199,6 +201,8 @@ API_PARSERS: dict[str, dict] = {
         "poll": True,
     },
     "llamaparse": {
+        "name": "LlamaParse",
+        "role": "parser",
         "endpoint": "https://api.cloud.llamaindex.ai/api/parsing/upload",
         "api_key_env": "LLAMA_CLOUD_API_KEY",
         "auth_header": "Authorization",
@@ -217,6 +221,8 @@ API_PARSERS: dict[str, dict] = {
 
 API_OCR_BACKENDS: dict[str, dict] = {
     "chandra": {
+        "name": "Chandra",
+        "role": "ocr",
         "endpoint": "https://www.datalab.to/api/v1/chandra",
         "api_key_env": "DATALAB_API_KEY",
         "auth_header": "X-API-Key",
@@ -353,7 +359,12 @@ def _api_get_key(cfg: dict) -> str:
     env_var = cfg["api_key_env"]
     api_key = os.environ.get(env_var)
     if not api_key:
-        raise ValueError(f"{env_var} environment variable is required.")
+        name = cfg.get("name", "unknown")
+        role = cfg.get("role", "backend")
+        raise ValueError(
+            f"Missing API key for {name} ({role}). "
+            f"Set {env_var} in your .env file or environment."
+        )
     return api_key
 
 
@@ -394,26 +405,61 @@ async def _ocr_page_via_api(page, cfg: dict) -> str:
 
 PLUGIN_PARSERS: dict[str, str] = {
     "docling": "petey.plugins.docling:extract_pages",
+    "unstructured": "petey.plugins.unstructured:extract_pages",
+    "textract": "petey.plugins.textract:extract_pages",
+    "google_documentai": "petey.plugins.google_documentai:extract_pages",
+    "azure_documentai": "petey.plugins.azure_documentai:extract_pages",
 }
 
-PLUGIN_OCR_BACKENDS: dict[str, str] = {}
+PLUGIN_OCR_BACKENDS: dict[str, str] = {
+    "mistral": "petey.plugins.mistral_ocr:ocr_page",
+    "easyocr": "petey.plugins.easyocr_backend:ocr_page",
+    "surya": "petey.plugins.surya_ocr:ocr_page",
+    "paddleocr": "petey.plugins.paddleocr_backend:ocr_page",
+    "google_vision": "petey.plugins.google_vision_ocr:ocr_page",
+}
 
 PLUGIN_LLM_BACKENDS: dict[str, str] = {}
 
 
+def _load_plugin(import_path: str):
+    """Import and return a plugin callable from a 'module:func' string."""
+    module_path, func_name = import_path.split(":")
+    module = importlib.import_module(module_path)
+    return getattr(module, func_name)
+
+
 def _make_plugin_loader(import_path: str):
-    """Return a wrapper that lazy-imports a plugin callable on first use."""
+    """Return a wrapper that lazy-imports a plugin callable on first use.
+
+    If the underlying function is async, the wrapper is async too,
+    so the concurrency manager routes it through the API pool.
+    If sync, routes through the CPU pool.
+    """
     _fn = None
 
-    def _lazy(*args, **kwargs):
+    def _lazy_sync(*args, **kwargs):
         nonlocal _fn
         if _fn is None:
-            module_path, func_name = import_path.split(":")
-            module = importlib.import_module(module_path)
-            _fn = getattr(module, func_name)
+            _fn = _load_plugin(import_path)
         return _fn(*args, **kwargs)
 
-    return _lazy
+    async def _lazy_async(*args, **kwargs):
+        nonlocal _fn
+        if _fn is None:
+            _fn = _load_plugin(import_path)
+        return await _fn(*args, **kwargs)
+
+    # Peek at the function to decide which wrapper to return.
+    # This imports the module at registry-build time, but the
+    # heavy dependencies are still behind lazy imports inside
+    # the plugin function itself (try/except ImportError).
+    fn = _load_plugin(import_path)
+    if asyncio.iscoroutinefunction(fn):
+        _fn = fn
+        return _lazy_async
+    _fn = fn
+    return _lazy_sync
 
 
 # --- Parser registry ---
@@ -537,51 +583,12 @@ def _ocr_page_tesseract(page) -> str:
     return pytesseract.image_to_string(img)
 
 
-def _ocr_page_mistral(page) -> str:
-    """OCR a single fitz page using Mistral's OCR API.
-
-    Renders the page to a PNG, base64-encodes it, and sends it to
-    Mistral's ``mistral-ocr-latest`` model.
-
-    Requires ``MISTRAL_API_KEY`` environment variable or will raise
-    ``ValueError``.
-    """
-    try:
-        from mistralai import Mistral
-    except ImportError:
-        raise ImportError(
-            "mistralai is required for ocr_backend='mistral'. "
-            "Install it with: pip install petey[mistral-ocr]"
-        )
-    api_key = os.environ.get("MISTRAL_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "Mistral OCR requires MISTRAL_API_KEY environment variable."
-        )
-    pix = page.get_pixmap(dpi=200)
-    img_b64 = base64.b64encode(pix.tobytes("png")).decode()
-    data_url = f"data:image/png;base64,{img_b64}"
-
-    client = Mistral(api_key=api_key)
-    response = client.ocr.process(
-        model="mistral-ocr-latest",
-        document={"type": "image_url", "image_url": data_url},
-    )
-    # Response contains pages with markdown text content
-    parts = []
-    for p in response.pages:
-        if p.markdown:
-            parts.append(p.markdown)
-    return "\n\n".join(parts) if parts else ""
-
-
 # --- OCR backend registry ---
 # Each backend is a callable: (page: fitz.Page) -> str
 # Local backends are plain functions; API backends are built from config.
 
 OCR_BACKENDS = {
     "tesseract": _ocr_page_tesseract,
-    "mistral": _ocr_page_mistral,
     **{name: _make_plugin_loader(path)
        for name, path in PLUGIN_OCR_BACKENDS.items()},
     **{name: partial(_ocr_page_via_api, cfg=cfg)
@@ -680,8 +687,13 @@ def _get_provider(model: str, llm_backend: str | None = None) -> str:
 def _make_client_openai(api_key: str | None = None, **kwargs):
     """Build an instructor-wrapped OpenAI async client."""
     base_url = kwargs.get("base_url")
-    key = api_key or os.environ.get(
-        kwargs.get("api_key_env", "OPENAI_API_KEY"))
+    env_var = kwargs.get("api_key_env", "OPENAI_API_KEY")
+    key = api_key or os.environ.get(env_var)
+    if not key:
+        raise ValueError(
+            f"Missing API key for OpenAI (llm). "
+            f"Set {env_var} in your .env file or environment."
+        )
     client_kwargs = {"api_key": key}
     if base_url:
         client_kwargs["base_url"] = base_url
@@ -690,8 +702,13 @@ def _make_client_openai(api_key: str | None = None, **kwargs):
 
 def _make_client_anthropic(api_key: str | None = None, **kwargs):
     """Build an instructor-wrapped Anthropic async client."""
-    key = api_key or os.environ.get(
-        kwargs.get("api_key_env", "ANTHROPIC_API_KEY"))
+    env_var = kwargs.get("api_key_env", "ANTHROPIC_API_KEY")
+    key = api_key or os.environ.get(env_var)
+    if not key:
+        raise ValueError(
+            f"Missing API key for Anthropic (llm). "
+            f"Set {env_var} in your .env file or environment."
+        )
     return instructor.from_anthropic(
         AsyncAnthropic(api_key=key), max_tokens=16384,
     )
