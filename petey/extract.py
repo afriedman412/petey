@@ -5,7 +5,7 @@ Configure via environment variables or pass explicitly.
 Pipeline architecture::
 
     PDF
-     └─ TextExtractor      (pymupdf | pdfplumber | tabula | marker | llamaparse | docling | …)
+     └─ TextExtractor      (pymupdf | pdfplumber | tabula | marker | liteparse | docling | …)
           └─ OCRBackend    (tesseract | mistral | chandra | none)
                └─ LLMBackend  (openai | anthropic | litellm)
                     └─ Output  (csv | json | jsonl)
@@ -37,6 +37,54 @@ SYSTEM = (
 )
 
 TEXT_WARN_THRESHOLD = 50_000
+SHORT_TEXT_THRESHOLD = 200  # warn before LLM if text is this short
+
+
+def _should_retry_with_ocr(data: dict) -> bool:
+    """Return True if extraction produced mostly null fields."""
+    fields = {
+        k: v for k, v in data.items()
+        if not k.startswith("_")
+    }
+    if not fields:
+        return False
+    null_count = sum(1 for v in fields.values() if v is None)
+    return null_count >= len(fields) * 0.8
+
+
+def _check_extraction_quality(
+    data: dict,
+    text: str,
+    label: str = "",
+) -> list[str]:
+    """Check extraction results for quality issues.
+
+    Returns a list of warning strings (empty if everything looks fine).
+    """
+    msgs = []
+    prefix = f"[petey] {label}: " if label else "[petey] "
+
+    # Check if text was suspiciously short
+    if len(text.strip()) < SHORT_TEXT_THRESHOLD:
+        msgs.append(
+            f"{prefix}extracted text was very short "
+            f"({len(text.strip())} chars) — PDF may need OCR"
+        )
+
+    # Check if most fields are null
+    if _should_retry_with_ocr(data):
+        fields = {
+            k: v for k, v in data.items()
+            if not k.startswith("_")
+        }
+        null_count = sum(
+            1 for v in fields.values() if v is None
+        )
+        msgs.append(
+            f"{prefix}{null_count}/{len(fields)} fields "
+            f"are null"
+        )
+    return msgs
 
 
 # --- PDF text extraction backends ---
@@ -242,23 +290,6 @@ API_PARSERS: dict[str, dict] = {
         "poll_status_key": "status",
         "poll_done_value": "succeeded",
         "timeout": 120,
-    },
-    "llamaparse": {
-        "name": "LlamaParse",
-        "role": "parser",
-        "endpoint": "https://api.cloud.llamaindex.ai/api/parsing/upload",
-        "api_key_env": "LLAMA_CLOUD_API_KEY",
-        "auth_header": "Authorization",
-        "auth_prefix": "Bearer",
-        "response_key": "markdown",
-        "poll": True,
-        "poll_check_key": "id",
-        "poll_url_template": (
-            "https://api.cloud.llamaindex.ai"
-            "/api/parsing/job/{id}/result/markdown"
-        ),
-        "poll_status_key": "status",
-        "poll_done_value": "SUCCESS",
     },
 }
 
@@ -493,6 +524,7 @@ async def _ocr_page_via_api(page, cfg: dict) -> str:
 
 PLUGIN_PARSERS: dict[str, str] = {
     "docling": "petey.plugins.docling:extract_pages",
+    "liteparse": "petey.plugins.liteparse:extract_pages",
     "unstructured": "petey.plugins.unstructured:extract_pages",
     "textract": "petey.plugins.textract:extract_pages",
     "google_documentai": "petey.plugins.google_documentai:extract_pages",
@@ -984,10 +1016,11 @@ async def extract_async(
         )
     client = _make_client(model, api_key, llm_backend)
     ocr_retried = False
+    label = os.path.basename(pdf_path)
     for attempt in range(5):
         try:
             async with mgr.api():
-                return await client.chat.completions.create(
+                result = await client.chat.completions.create(
                     model=model,
                     response_model=response_model,
                     max_retries=2,
@@ -997,6 +1030,35 @@ async def extract_async(
                     temperature=0,
                     max_tokens=4096,
                 )
+                data = result.model_dump(by_alias=True)
+                if (
+                    not ocr_retried
+                    and pdf_path
+                    and _should_retry_with_ocr(data)
+                ):
+                    ocr_retried = True
+                    print(
+                        f"[petey] {label}: mostly null "
+                        f"fields, retrying with OCR",
+                        flush=True,
+                    )
+                    try:
+                        ocr_text = await mgr.run_cpu(
+                            _ocr_full_doc, pdf_path,
+                        )
+                        if (
+                            ocr_text
+                            and len(ocr_text.strip()) > 50
+                        ):
+                            text = ocr_text
+                            continue
+                    except Exception:
+                        pass
+                for msg in _check_extraction_quality(
+                    data, text, label=label,
+                ):
+                    print(msg, flush=True)
+                return result
         except Exception as e:
             err_str = str(e)
             is_rate_limit = (
@@ -1427,8 +1489,54 @@ async def extract_pages_async(
                             temperature=0,
                         )
                     )
-                    data = result.model_dump()
+                    data = result.model_dump(by_alias=True)
                     data["_page"] = label
+                    if (
+                        not ocr_retried
+                        and _should_retry_with_ocr(data)
+                    ):
+                        ocr_retried = True
+                        print(
+                            f"[petey] {label}: mostly "
+                            f"null fields, retrying "
+                            f"with OCR",
+                            flush=True,
+                        )
+                        try:
+                            ocr_pages = (
+                                await asyncio.gather(*[
+                                    mgr.run_cpu(
+                                        _ocr_single_page,
+                                        pdf_path, i,
+                                    )
+                                    for i in idx_slice
+                                ])
+                            )
+                            ocr_text = "\n\n".join(
+                                ocr_pages
+                            )
+                            if (
+                                ocr_text
+                                and len(
+                                    ocr_text.strip()
+                                ) > 50
+                            ):
+                                text = (
+                                    (
+                                        header_text
+                                        + "\n\n"
+                                        + ocr_text
+                                    )
+                                    if header_text
+                                    else ocr_text
+                                )
+                                continue
+                        except Exception:
+                            pass
+                    for msg in _check_extraction_quality(
+                        data, text, label=label,
+                    ):
+                        print(msg, flush=True)
                     break
                 except Exception as e:
                     err_str = str(e)
@@ -1620,8 +1728,47 @@ async def extract_batch(
                         temperature=0,
                     )
                 )
-            data = result.model_dump()
-            data["_source_file"] = os.path.basename(path)
+            data = result.model_dump(by_alias=True)
+            fname = os.path.basename(path)
+            data["_source_file"] = fname
+            if _should_retry_with_ocr(data):
+                print(
+                    f"[petey] {fname}: mostly null "
+                    f"fields, retrying with OCR",
+                    flush=True,
+                )
+                try:
+                    ocr_text = await mgr.run_cpu(
+                        _ocr_full_doc, path,
+                    )
+                    if (
+                        ocr_text
+                        and len(ocr_text.strip()) > 50
+                    ):
+                        async with mgr.api():
+                            result = (
+                                await client.chat
+                                .completions.create(
+                                    model=model,
+                                    response_model=(
+                                        response_model
+                                    ),
+                                    max_retries=2,
+                                    messages=_make_messages(
+                                        ocr_text,
+                                        instructions,
+                                    ),
+                                    temperature=0,
+                                )
+                            )
+                        data = result.model_dump(by_alias=True)
+                        data["_source_file"] = fname
+                except Exception:
+                    pass
+            for msg in _check_extraction_quality(
+                data, text, label=fname,
+            ):
+                print(msg, flush=True)
         except Exception as e:
             data = {
                 "_source_file": os.path.basename(path),

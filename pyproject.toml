@@ -48,6 +48,26 @@ dev = [
 ]
 mistral-ocr = ["mistralai>=1.0,<2"]
 tabula = ["tabula-py", "jpype1"]
+docling = ["docling"]
+liteparse = ["liteparse"]
+easyocr = ["easyocr"]
+paddleocr = ["paddleocr", "paddlepaddle"]
+unstructured = ["unstructured[pdf]"]
+aws = ["boto3"]
+google = ["google-cloud-documentai", "google-cloud-vision"]
+azure = ["azure-ai-documentintelligence"]
+all = [
+    "petey[mistral-ocr]",
+    "petey[tabula]",
+    "petey[docling]",
+    "petey[liteparse]",
+    "petey[easyocr]",
+    "petey[paddleocr]",
+    "petey[unstructured]",
+    "petey[aws]",
+    "petey[google]",
+    "petey[azure]",
+]
 
 [tool.setuptools.packages.find]
 include = ["petey*"]

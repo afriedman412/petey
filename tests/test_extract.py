@@ -382,6 +382,67 @@ class TestMakeMessages:
 
 
 # ---------------------------------------------------------------------------
+# Extraction quality checks
+# ---------------------------------------------------------------------------
+
+class TestCheckExtractionQuality:
+    def test_all_nulls_warns(self):
+        from petey.extract import _check_extraction_quality
+        data = {"name": None, "age": None, "city": None}
+        msgs = _check_extraction_quality(data, "some text " * 50)
+        assert any("3/3 fields" in m for m in msgs)
+
+    def test_mostly_nulls_warns(self):
+        from petey.extract import _check_extraction_quality
+        data = {
+            "a": None, "b": None, "c": None, "d": None,
+            "e": None, "f": "value",
+        }
+        msgs = _check_extraction_quality(data, "some text " * 50)
+        assert any("5/6 fields" in m for m in msgs)
+
+    def test_should_retry_with_ocr(self):
+        from petey.extract import _should_retry_with_ocr
+        assert _should_retry_with_ocr(
+            {"a": None, "b": None, "c": None}
+        )
+        assert _should_retry_with_ocr(
+            {"a": None, "b": None, "c": None,
+             "d": None, "e": "val"}
+        )
+        assert not _should_retry_with_ocr(
+            {"a": "val", "b": "val", "c": None, "d": None}
+        )
+        assert not _should_retry_with_ocr(
+            {"a": "val", "b": "val", "c": "val"}
+        )
+
+    def test_short_text_warns(self):
+        from petey.extract import _check_extraction_quality
+        data = {"name": "Alice", "age": 30}
+        msgs = _check_extraction_quality(data, "short")
+        assert any("very short" in m for m in msgs)
+
+    def test_good_extraction_no_warnings(self):
+        from petey.extract import _check_extraction_quality
+        data = {"name": "Alice", "age": 30, "city": "NYC"}
+        msgs = _check_extraction_quality(data, "x" * 500)
+        assert msgs == []
+
+    def test_ignores_underscore_fields(self):
+        from petey.extract import _check_extraction_quality
+        data = {"_page": "p1", "_source_file": "test.pdf", "name": "Alice"}
+        msgs = _check_extraction_quality(data, "x" * 500)
+        assert msgs == []
+
+    def test_label_in_message(self):
+        from petey.extract import _check_extraction_quality
+        data = {"name": None}
+        msgs = _check_extraction_quality(data, "short", label="p1")
+        assert any("p1" in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
 # Schema edge cases
 # ---------------------------------------------------------------------------
 
@@ -1012,7 +1073,6 @@ class TestRegistries:
     def test_parser_registry_has_api_backends(self):
         from petey.extract import PARSERS
         assert "marker" in PARSERS
-        assert "llamaparse" in PARSERS
 
     def test_parser_registry_has_plugin_backends(self):
         from petey.extract import PARSERS
@@ -1051,7 +1111,7 @@ class TestRegistries:
 
     def test_api_parsers_are_callable(self):
         from petey.extract import PARSERS
-        for name in ["marker", "llamaparse"]:
+        for name in ["marker"]:
             assert callable(PARSERS[name])
 
     def test_api_ocr_are_callable(self):
@@ -1884,33 +1944,6 @@ class TestPollUrlTemplate:
 # ---------------------------------------------------------------------------
 # LlamaParse config
 # ---------------------------------------------------------------------------
-
-class TestLlamaParseConfig:
-    """Verify the llamaparse API_PARSERS entry is correct."""
-
-    def test_llamaparse_uses_bearer_auth(self):
-        from petey.extract import API_PARSERS
-        cfg = API_PARSERS["llamaparse"]
-        assert cfg["auth_header"] == "Authorization"
-        assert cfg["auth_prefix"] == "Bearer"
-
-    def test_llamaparse_uses_poll_url_template(self):
-        from petey.extract import API_PARSERS
-        cfg = API_PARSERS["llamaparse"]
-        assert "poll_url_template" in cfg
-        assert "{id}" in cfg["poll_url_template"]
-        assert cfg["poll_check_key"] == "id"
-
-    def test_llamaparse_poll_done_value(self):
-        from petey.extract import API_PARSERS
-        cfg = API_PARSERS["llamaparse"]
-        assert cfg["poll_done_value"] == "SUCCESS"
-
-    def test_llamaparse_api_key_env(self):
-        from petey.extract import API_PARSERS
-        cfg = API_PARSERS["llamaparse"]
-        assert cfg["api_key_env"] == "LLAMA_CLOUD_API_KEY"
-
 
 # ---------------------------------------------------------------------------
 # Plugin registries

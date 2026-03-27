@@ -30,8 +30,9 @@ The first step is getting text out of the PDF. Different extractors work better 
 | `pdfplumber` | included | Borderless tables | Layout-preserving extraction that positions text spatially. Good for documents where columns are aligned by whitespace rather than cell borders. |
 | `tabula` | `pip install petey[tabula]` | Structured tables | Uses tabula-py (Java-based) to detect and extract tables as DataFrames. Falls back to pymupdf for pages without tables. Requires Java. |
 | `marker` | included | Complex layouts | Remote API via Datalab. Requires `DATALAB_API_KEY`. |
-| `llamaparse` | included | Complex layouts | Remote API via LlamaCloud. Requires `LLAMA_CLOUD_API_KEY`. |
-| `docling` | `pip install docling` | Complex layouts | Local conversion via IBM Docling. No API key needed. |
+| `liteparse` | `pip install petey[liteparse]` | Lightweight local parsing | Fast local parsing with spatial layout from LlamaIndex. No API key needed. |
+
+Additional parsers available via plugins (see `petey list parsers`): `unstructured`, `unstructured_api`, `azure_documentai`, `textract`, `google_documentai`, `docling`. These cover cloud services (AWS, Azure, Google) and heavier local tools. Install with `pip install petey[aws]`, `petey[azure]`, `petey[google]`, etc.
 
 Parsers are registered in the `PARSERS` dict. Local parsers are sync functions; API parsers (like `marker`) are async and automatically routed through the API concurrency pool. To add a new API parser, add an entry to `API_PARSERS` — no new code needed. To add a new local parser, add an entry to `PLUGIN_PARSERS` with a `"module:callable"` path — the dependency is lazy-imported on first use.
 
@@ -43,20 +44,23 @@ If a PDF has no embedded text layer (e.g. a scanned document), Petey can fall ba
 |---------|---------|--------------|
 | `none` | — | No OCR. Default. |
 | `tesseract` | included | Local OCR via pytesseract. Requires the Tesseract binary installed on your system. |
-| `mistral` | `pip install petey[mistral-ocr]` | Cloud OCR via Mistral's `mistral-ocr-latest` model. Sends page images to the Mistral API. Requires `MISTRAL_API_KEY`. |
+| `mistral` | `pip install petey[mistral-ocr]` | Cloud OCR via Mistral's `mistral-ocr-latest` model. Requires `MISTRAL_API_KEY`. |
 | `chandra` | included | Cloud OCR via Datalab. Requires `DATALAB_API_KEY`. |
+| `surya` | included | Cloud OCR via Datalab (Surya model). Requires `DATALAB_API_KEY`. |
+
+Additional OCR backends available via plugins (see `petey list ocr`): `easyocr`, `paddleocr`, `google_vision`. Note that `easyocr` and `paddleocr` are ML-heavy and slow on CPU — cloud OCR backends are recommended for most use cases.
 
 Like parsers, OCR backends are registered in `OCR_BACKENDS`. API backends are async and can be added via `API_OCR_BACKENDS`.
 
 ### LLM Backends
 
-The LLM interprets the extracted text and returns structured data matching your schema. Petey auto-detects the right backend from the model name, or you can set it explicitly.
+The LLM interprets the extracted text and returns structured data matching your schema. Petey auto-detects the right backend from the model name.
 
 | Backend | Install | Models | Auto-detected when |
 |---------|---------|--------|--------------------|
 | `openai` | included | `gpt-4.1-mini`, `gpt-4o`, etc. | Model name doesn't match other patterns (default) |
 | `anthropic` | included | `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, etc. | Model starts with `claude` |
-| `litellm` | included | Gemini, Mistral, Ollama, Bedrock, Vertex AI, Cohere, 100+ more | Model starts with `gemini/`, `mistral/`, `ollama/`, `bedrock/`, etc. |
+| `litellm` | included | Gemini, Mistral, Fireworks, Ollama, Bedrock, Vertex AI, Cohere, 100+ more | Model starts with `gemini/`, `mistral/`, `fireworks_ai/`, `ollama/`, `bedrock/`, etc. |
 
 ### Adding Custom Backends
 
@@ -97,7 +101,7 @@ For local parsers that need a third-party package, use `PLUGIN_PARSERS` — the 
 from petey.extract import PLUGIN_PARSERS
 
 PLUGIN_PARSERS["my_parser"] = "my_package.pdf:extract_pages"
-# callable signature: (pdf_path: str) -> list[str]  (one string per page)
+# callable signature: (pdf_path: str, **kwargs) -> list[str]  (one string per page)
 ```
 
 ### Concurrency
@@ -130,10 +134,11 @@ Or for Anthropic:
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Or for any provider via litellm (e.g. Gemini):
+Or for any provider via litellm (e.g. Gemini, Fireworks):
 
 ```
 GEMINI_API_KEY=...
+FIREWORKS_API_KEY=...
 ```
 
 Petey defaults to `gpt-4.1-mini`, which is fast and cheap and handles most documents well. To use a different model, pass `--model` on the CLI or set a default in `.env`:
@@ -181,8 +186,8 @@ All fields are nullable — Petey returns `null` for anything it can't find rath
 | `output` | Output file path. Format inferred from extension (`.csv`, `.json`, `.jsonl`). Overridden by `-o`. Defaults to CSV for table mode, JSON for query mode. |
 | `mode: table` | Extract multiple records per page (default: `query` — one record per file). Accepts `record_type: array` for backwards compatibility. |
 | `model` | LLM model ID (e.g. `gpt-4.1-mini`, `claude-sonnet-4-6`). Overridden by `--model` or `PETEY_MODEL` env var. |
-| `parser` | Text extraction backend: `pymupdf` (default), `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`, or `docling`. Overridden by `--parser`. |
-| `ocr` | OCR backend: `none` (default), `tesseract`, `mistral`, `chandra`. Overridden by `--ocr`. |
+| `parser` | Text extraction backend. Overridden by `--parser`. See `petey list parsers` for all options. |
+| `ocr` | OCR backend: `none` (default), `tesseract`, `mistral`, `chandra`, `surya`. Overridden by `--ocr`. |
 | `parser_options` | Dict of extra kwargs passed to the parser (e.g. `languages: [en, fr]`) |
 | `ocr_options` | Dict of extra kwargs passed to the OCR backend |
 | `instructions` | Extra guidance appended to the prompt (e.g. "ignore the summary row") |
@@ -265,13 +270,13 @@ petey extract --schema schema.yaml --model gpt-4.1-mini ./pdfs/
 petey extract --schema schema.yaml --model claude-sonnet-4-6 ./pdfs/
 
 # Gemini via litellm
-petey extract --schema schema.yaml --model gemini/gemini-2.0-flash ./pdfs/
+petey extract --schema schema.yaml --model gemini/gemini-2.5-flash ./pdfs/
+
+# Fireworks
+petey extract --schema schema.yaml --model fireworks_ai/accounts/fireworks/models/llama4-scout-instruct-basic ./pdfs/
 
 # Ollama (local)
 petey extract --schema schema.yaml --model ollama/llama3 ./pdfs/
-
-# Explicit backend override
-petey extract --schema schema.yaml --model my-model --llm-backend litellm ./pdfs/
 ```
 
 ## CLI Reference
@@ -290,8 +295,8 @@ petey extract --schema schema.yaml ./pdfs/ -o results.csv
 | `--mode` | from schema | `query` (one record per file) or `table` (multiple records per page) |
 | `--query` | — | Shorthand for `--mode query` |
 | `--table` | — | Shorthand for `--mode table` |
-| `--parser` | from schema | Text extraction backend (`pymupdf`, `tables`, `pdfplumber`, `tabula`, `marker`, `llamaparse`, `docling`) |
-| `--ocr` | from schema | OCR backend (`none`, `tesseract`, `mistral`, `chandra`) |
+| `--parser` | from schema | Text extraction backend (see `petey list parsers`) |
+| `--ocr` | from schema | OCR backend (see `petey list ocr`) |
 | `--pages-per-chunk / -p` | `1` for tables | Pages per LLM call (set to `0` to disable chunking) |
 | `--header-pages` | from schema | Header pages to prepend to each chunk |
 | `--page-range` | from schema | Page range to extract (e.g. `2-5` or `1,3,5-7`) |
@@ -329,7 +334,16 @@ result = extract(
 ## Optional Dependencies
 
 ```bash
-pip install petey                    # Core (includes tesseract OCR + litellm)
+pip install petey                    # Core (pymupdf, pdfplumber, tesseract, litellm)
 pip install petey[mistral-ocr]       # + Mistral OCR
 pip install petey[tabula]            # + Tabula table extraction (requires Java)
+pip install petey[liteparse]         # + LiteParse local parser
+pip install petey[unstructured]      # + Unstructured local parser
+pip install petey[aws]               # + Amazon Textract
+pip install petey[google]            # + Google Document AI & Vision OCR
+pip install petey[azure]             # + Azure Document Intelligence
+pip install petey[docling]           # + IBM Docling (GPU recommended)
+pip install petey[easyocr]           # + EasyOCR (GPU recommended)
+pip install petey[paddleocr]         # + PaddleOCR (GPU recommended)
+pip install petey[all]               # Everything
 ```

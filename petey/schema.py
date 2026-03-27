@@ -14,9 +14,24 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
 
 
+def _safe_field_name(name: str) -> str:
+    """Sanitize field name to match API property key patterns."""
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", name)
+
+
 def _build_field(name: str, cfg: dict) -> tuple:
     ftype = cfg["type"]
     desc = cfg.get("description", "")
+    safe = _safe_field_name(name)
+    alias = name if safe != name else None
+
+    def field(**kw):
+        if alias:
+            return Field(
+                serialization_alias=alias,
+                **kw,
+            )
+        return Field(**kw)
 
     if ftype in ("category", "enum"):
         values = cfg.get("values", [])
@@ -26,36 +41,56 @@ def _build_field(name: str, cfg: dict) -> tuple:
                 {v.replace(" ", "_").lower(): v for v in values},
                 type=str,
             )
-            return enum_cls | None, Field(None, description=desc)
+            return (
+                enum_cls | None,
+                field(default=None, description=desc),
+            )
         infer_desc = (
             desc + " (infer possible values from the data)"
             if desc
             else "Infer possible values from the data"
         )
-        return str | None, Field(None, description=infer_desc)
+        return (
+            str | None,
+            field(default=None, description=infer_desc),
+        )
     elif ftype == "number":
-        return float | None, Field(None, description=desc)
+        return (
+            float | None,
+            field(default=None, description=desc),
+        )
     elif ftype == "array":
         sub_fields = {}
         for sub_name, sub_cfg in cfg.get("fields", {}).items():
-            sub_fields[sub_name] = _build_field(sub_name, sub_cfg)
-        sub_model = create_model(_safe_name(name) + "_item", **sub_fields)
-        return list[sub_model] | None, Field(None, description=desc)
+            s_safe = _safe_field_name(sub_name)
+            sub_fields[s_safe] = _build_field(sub_name, sub_cfg)
+        sub_model = create_model(
+            _safe_name(name) + "_item", **sub_fields,
+        )
+        return (
+            list[sub_model] | None,
+            field(default=None, description=desc),
+        )
     else:  # string, date
-        return str | None, Field(None, description=desc)
+        return (
+            str | None,
+            field(default=None, description=desc),
+        )
 
 
 def build_model(spec: dict) -> type[BaseModel]:
     """Build a Pydantic model from a schema spec dict."""
     field_definitions = {}
     for name, cfg in spec["fields"].items():
-        field_definitions[name] = _build_field(name, cfg)
+        safe = _safe_field_name(name)
+        field_definitions[safe] = _build_field(name, cfg)
 
     model_name = _safe_name(spec.get("name", "ExtractedData"))
     model = create_model(
         model_name,
         **field_definitions,
     )
+    model.model_config["populate_by_name"] = True
 
     if spec.get("mode") == "table" or spec.get("record_type") == "array":
         model = create_model(
