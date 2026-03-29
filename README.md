@@ -1,6 +1,6 @@
 # Petey
 
-Petey is a framework for PDF data extraction. It wires the PDF parser of your choice to the LLM of your choice, and with a simple schema from the user, pulls structured data out of PDF documents.
+Petey is a framework for PDF data extraction. It wires the PDF parser of your choice to the LLM of your choice, and with a simple schema from the user, pulls data out of PDF documents.
 
 ```bash
 pip install petey
@@ -21,7 +21,7 @@ Petey does the wiring for you. Just pass it your files and a schema that explain
 ## How it works
 
 1. **Parse** — extract text from the PDF using a local or cloud parser
-2. **LLM** — send the text to an LLM with your schema to get structured fields back
+2. **LLM** — send the text to an LLM with your schema to get the fields you want back
 3. **Output** — return the results as JSON or CSV
 
 ## Parsers
