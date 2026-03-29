@@ -807,6 +807,7 @@ def _get_provider(model: str, llm_backend: str | None = None) -> str:
         "gemini/", "mistral/", "ollama/", "ollama_chat/",
         "bedrock/", "vertex_ai/", "cohere/", "replicate/",
         "huggingface/", "together_ai/", "openrouter/",
+        "fireworks_ai/", "deepseek/",
     )
     if any(model.startswith(p) for p in litellm_prefixes):
         return "litellm"
@@ -845,8 +846,9 @@ def _make_client_anthropic(api_key: str | None = None, **kwargs):
 
 def _make_client_litellm(api_key: str | None = None, **kwargs):
     """Build an instructor-wrapped litellm client."""
-    from litellm import acompletion
-    return instructor.from_litellm(acompletion)
+    import litellm
+    litellm.drop_params = True
+    return instructor.from_litellm(litellm.acompletion)
 
 
 # --- LLM backend registry ---

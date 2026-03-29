@@ -2025,3 +2025,71 @@ class TestBackendOptions:
         mock_ocr.assert_called_once()
         _, kwargs = mock_ocr.call_args
         assert kwargs["languages"] == ["en", "fr"]
+
+
+# ---------------------------------------------------------------------------
+# Fireworks / DeepSeek litellm routing
+# ---------------------------------------------------------------------------
+
+class TestLitellmRouting:
+    def test_fireworks_routes_to_litellm(self):
+        from petey.extract import _get_provider
+        assert _get_provider("fireworks_ai/accounts/fireworks/models/llama-v3p3-70b-instruct") == "litellm"
+
+    def test_deepseek_routes_to_litellm(self):
+        from petey.extract import _get_provider
+        assert _get_provider("deepseek/deepseek-chat") == "litellm"
+
+
+# ---------------------------------------------------------------------------
+# Case-insensitive enum validation
+# ---------------------------------------------------------------------------
+
+class TestEnumCaseInsensitive:
+    def test_exact_case(self):
+        spec = {"fields": {"status": {
+            "type": "enum", "values": ["Open", "Closed"], "description": "",
+        }}}
+        model = build_model(spec)
+        assert model(status="Open").status.value == "Open"
+
+    def test_lowercase_matches(self):
+        spec = {"fields": {"status": {
+            "type": "enum", "values": ["Open", "Closed"], "description": "",
+        }}}
+        model = build_model(spec)
+        assert model(status="open").status.value == "Open"
+        assert model(status="closed").status.value == "Closed"
+
+    def test_uppercase_matches(self):
+        spec = {"fields": {"status": {
+            "type": "enum", "values": ["Open", "Closed"], "description": "",
+        }}}
+        model = build_model(spec)
+        assert model(status="OPEN").status.value == "Open"
+
+    def test_multiword_enum(self):
+        spec = {"fields": {"status": {
+            "type": "enum", "values": ["In Progress", "Not Started"], "description": "",
+        }}}
+        model = build_model(spec)
+        assert model(status="in progress").status.value == "In Progress"
+        assert model(status="IN PROGRESS").status.value == "In Progress"
+
+    def test_gender_case_insensitive(self):
+        spec = {"fields": {"gender": {
+            "type": "enum", "values": ["Male", "Female", "Non-binary"], "description": "",
+        }}}
+        model = build_model(spec)
+        assert model(gender="Non-Binary").gender.value == "Non-binary"
+        assert model(gender="MALE").gender.value == "Male"
+        assert model(gender="female").gender.value == "Female"
+
+    def test_invalid_value_still_fails(self):
+        from pydantic import ValidationError
+        spec = {"fields": {"status": {
+            "type": "enum", "values": ["Open", "Closed"], "description": "",
+        }}}
+        model = build_model(spec)
+        with pytest.raises(ValidationError):
+            model(status="invalid")

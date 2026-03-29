@@ -6,7 +6,8 @@ import re
 
 import yaml
 from pathlib import Path
-from pydantic import BaseModel, Field, create_model
+from typing import Annotated
+from pydantic import BaseModel, BeforeValidator, Field, create_model
 
 
 def _safe_name(name: str) -> str:
@@ -41,8 +42,18 @@ def _build_field(name: str, cfg: dict) -> tuple:
                 {v.replace(" ", "_").lower(): v for v in values},
                 type=str,
             )
+            # Case-insensitive enum matching
+            _val_map = {v.lower(): v for v in values}
+
+            def _coerce_enum(v, _map=_val_map):
+                if isinstance(v, str):
+                    match = _map.get(v.strip().lower())
+                    if match is not None:
+                        return match
+                return v
+
             return (
-                enum_cls | None,
+                Annotated[enum_cls, BeforeValidator(_coerce_enum)] | None,
                 field(default=None, description=desc),
             )
         infer_desc = (
