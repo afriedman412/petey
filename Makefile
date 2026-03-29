@@ -16,7 +16,7 @@ test: install
 publish:
 	rm -rf dist/
 	$(PYTHON) -m build
-	. .env && $(PYTHON) -m twine upload dist/* -u __token__ -p $$PYPI_API_KEY
+	. ../.env && $(PYTHON) -m twine upload dist/* -u __token__ -p $$PYPI_API_KEY
 
 _current_version = $(shell grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 _major = $(word 1,$(subst ., ,$(_current_version)))
