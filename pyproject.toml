@@ -46,23 +46,15 @@ dev = [
     "build",
     "twine",
 ]
-mistral-ocr = ["mistralai>=1.0,<2"]
-tabula = ["tabula-py", "jpype1"]
 docling = ["docling"]
 liteparse = ["liteparse"]
-easyocr = ["easyocr"]
-paddleocr = ["paddleocr", "paddlepaddle"]
 unstructured = ["unstructured[pdf]"]
 aws = ["boto3"]
-google = ["google-cloud-documentai", "google-cloud-vision"]
+google = ["google-cloud-documentai"]
 azure = ["azure-ai-documentintelligence"]
 all = [
-    "petey[mistral-ocr]",
-    "petey[tabula]",
     "petey[docling]",
     "petey[liteparse]",
-    "petey[easyocr]",
-    "petey[paddleocr]",
     "petey[unstructured]",
     "petey[aws]",
     "petey[google]",

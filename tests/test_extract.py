@@ -13,7 +13,6 @@ from unittest.mock import (
 import pytest
 
 from petey import extract_text, extract_text_pages, build_model, load_schema
-from petey.extract import OCR_THRESHOLD
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MCI_PDF = FIXTURES / "mci_page1.pdf"
@@ -401,22 +400,6 @@ class TestCheckExtractionQuality:
         msgs = _check_extraction_quality(data, "some text " * 50)
         assert any("5/6 fields" in m for m in msgs)
 
-    def test_should_retry_with_ocr(self):
-        from petey.extract import _should_retry_with_ocr
-        assert _should_retry_with_ocr(
-            {"a": None, "b": None, "c": None}
-        )
-        assert _should_retry_with_ocr(
-            {"a": None, "b": None, "c": None,
-             "d": None, "e": "val"}
-        )
-        assert not _should_retry_with_ocr(
-            {"a": "val", "b": "val", "c": None, "d": None}
-        )
-        assert not _should_retry_with_ocr(
-            {"a": "val", "b": "val", "c": "val"}
-        )
-
     def test_short_text_warns(self):
         from petey.extract import _check_extraction_quality
         data = {"name": "Alice", "age": 30}
@@ -543,147 +526,6 @@ class TestParsers:
         assert isinstance(pages, list)
         assert len(pages) >= 1
         assert any("WESTCHESTER COUNTY" in p for p in pages)
-
-    # --- tabula ---
-
-    def test_tabula_import_error(self):
-        with patch.dict("sys.modules", {"tabula": None}):
-            with pytest.raises(ImportError, match="petey\\[tabula\\]"):
-                extract_text(str(MCI_PDF), parser="tabula")
-
-    def test_tabula_pages_import_error(self):
-        with patch.dict("sys.modules", {"tabula": None}):
-            with pytest.raises(ImportError, match="petey\\[tabula\\]"):
-                extract_text_pages(str(MCI_PDF), parser="tabula")
-
-    def test_tabula_calls_read_pdf(self):
-        mock_tabula = MagicMock()
-        # Mock a DataFrame-like object with to_csv
-        mock_df = MagicMock()
-        mock_df.to_csv.return_value = "col\nval"
-        mock_tabula.read_pdf.return_value = [mock_df]
-        with patch.dict("sys.modules", {"tabula": mock_tabula}):
-            pages = extract_text_pages(str(MCI_PDF), parser="tabula")
-        assert isinstance(pages, list)
-        assert len(pages) >= 1
-
-    # --- OCR backends ---
-
-    def test_ocr_threshold_constant(self):
-        assert OCR_THRESHOLD == 100
-
-    def test_ocr_not_triggered_when_text_present(self):
-        # MCI PDF has plenty of text — OCR should never be called
-        with patch("petey.extract._ocr_full") as mock_ocr:
-            text = extract_text(
-                str(MCI_PDF), parser="pymupdf", ocr_fallback=True,
-            )
-        mock_ocr.assert_not_called()
-        assert "WESTCHESTER COUNTY" in text
-
-    def test_ocr_not_triggered_with_ocr_backend(self):
-        with patch("petey.extract._ocr_full") as mock_ocr:
-            text = extract_text(
-                str(MCI_PDF), parser="pymupdf",
-                ocr_backend="tesseract",
-            )
-        mock_ocr.assert_not_called()
-        assert "WESTCHESTER COUNTY" in text
-
-    def test_ocr_triggered_when_no_text(self, tmp_path):
-        import fitz
-        doc = fitz.open()
-        doc.new_page()
-        blank_pdf = tmp_path / "blank.pdf"
-        doc.save(str(blank_pdf))
-
-        with patch(
-            "petey.extract._ocr_page", return_value="ocr result"
-        ) as mock_ocr:
-            text = extract_text(
-                str(blank_pdf), parser="pymupdf", ocr_fallback=True,
-            )
-        mock_ocr.assert_called_once()
-        assert "ocr result" in text
-
-    def test_ocr_triggered_with_ocr_backend(self, tmp_path):
-        import fitz
-        doc = fitz.open()
-        doc.new_page()
-        blank_pdf = tmp_path / "blank.pdf"
-        doc.save(str(blank_pdf))
-
-        with patch(
-            "petey.extract._ocr_page", return_value="ocr result"
-        ) as mock_ocr:
-            text = extract_text(
-                str(blank_pdf), parser="pymupdf",
-                ocr_backend="tesseract",
-            )
-        mock_ocr.assert_called_once()
-        assert "ocr result" in text
-
-    def test_ocr_not_triggered_when_fallback_disabled(self, tmp_path):
-        import fitz
-        doc = fitz.open()
-        doc.new_page()
-        blank_pdf = tmp_path / "blank.pdf"
-        doc.save(str(blank_pdf))
-
-        with patch("petey.extract._ocr_page") as mock_ocr:
-            extract_text(
-                str(blank_pdf), parser="pymupdf", ocr_fallback=False,
-            )
-        mock_ocr.assert_not_called()
-
-    def test_ocr_backend_resolve_fallback(self):
-        from petey.extract import _resolve_ocr_backend
-        assert _resolve_ocr_backend(True, "none") == "tesseract"
-        assert _resolve_ocr_backend(False, "none") == "none"
-        assert _resolve_ocr_backend(True, "mistral") == "mistral"
-        assert _resolve_ocr_backend(False, "tesseract") == "tesseract"
-
-    def test_mistral_ocr_import_error(self):
-        from petey.plugins.mistral_ocr import ocr_page
-        mock_page = MagicMock()
-        with patch.dict("sys.modules", {"mistralai": None}):
-            with pytest.raises(
-                ImportError, match="petey\\[mistral-ocr\\]"
-            ):
-                ocr_page(mock_page)
-
-    def test_mistral_ocr_missing_api_key(self):
-        from petey.plugins.mistral_ocr import ocr_page
-        mock_mistralai = MagicMock()
-        mock_page = MagicMock()
-        with patch.dict("sys.modules", {"mistralai": mock_mistralai}):
-            with patch.dict(os.environ, {}, clear=True):
-                with pytest.raises(ValueError, match="MISTRAL_API_KEY"):
-                    ocr_page(mock_page)
-
-    def test_ocr_backend_falls_back_to_pdfplumber(self):
-        """When --ocr is set with pymupdf parser, should switch to pdfplumber
-        to avoid pymupdf4llm's built-in OCR."""
-        with patch("petey.extract.pymupdf4llm") as mock_p4l:
-            pages = extract_text_pages(
-                str(MCI_PDF), parser="pymupdf", ocr_backend="tesseract",
-            )
-            # pymupdf4llm should NOT be called — pdfplumber is used instead
-            mock_p4l.to_markdown.assert_not_called()
-            # Should still return page content (from pdfplumber)
-            assert isinstance(pages, list)
-            assert len(pages) >= 1
-
-    def test_pymupdf_used_when_no_ocr_backend(self):
-        """Without --ocr, pymupdf4llm should be used as normal."""
-        with patch("petey.extract.pymupdf4llm") as mock_p4l:
-            mock_p4l.to_markdown.return_value = [
-                {"text": "x" * 200}
-            ]
-            extract_text_pages(
-                str(MCI_PDF), parser="pymupdf", ocr_backend="none",
-            )
-            mock_p4l.to_markdown.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1027,37 +869,6 @@ class TestParsePdfViaApi:
         assert result == [""]
 
 
-class TestOcrPageViaApi:
-    """Test the OCR wrapper around _api_post."""
-
-    @patch.dict(os.environ, {"TEST_KEY": "k"})
-    def test_renders_and_posts(self):
-        from petey.extract import _ocr_page_via_api
-        mock_page = MagicMock()
-        mock_pix = MagicMock()
-        mock_pix.tobytes.return_value = b"png bytes"
-        mock_page.get_pixmap.return_value = mock_pix
-        cfg = {
-            "endpoint": "https://example.com/ocr",
-            "api_key_env": "TEST_KEY",
-            "poll": False,
-            "response_key": "text",
-        }
-        with patch("petey.extract._api_post",
-                    new_callable=AsyncMock,
-                    return_value="ocr text") as mock_post:
-            result = asyncio.run(
-                _ocr_page_via_api(mock_page, cfg)
-            )
-
-        assert result == "ocr text"
-        mock_page.get_pixmap.assert_called_once_with(dpi=200)
-        args, _ = mock_post.call_args
-        assert args[1] == b"png bytes"
-        assert args[2] == "page.png"
-        assert args[3] == "image/png"
-
-
 # ---------------------------------------------------------------------------
 # Registry wiring
 # ---------------------------------------------------------------------------
@@ -1067,28 +878,16 @@ class TestRegistries:
 
     def test_parser_registry_has_local_backends(self):
         from petey.extract import PARSERS
-        for name in ["pymupdf", "pdfplumber", "tables", "tabula"]:
+        for name in ["pymupdf", "pdfplumber"]:
             assert name in PARSERS, f"Missing parser: {name}"
 
     def test_parser_registry_has_api_backends(self):
         from petey.extract import PARSERS
-        assert "marker" in PARSERS
+        assert "datalab" in PARSERS
 
     def test_parser_registry_has_plugin_backends(self):
         from petey.extract import PARSERS
         assert "docling" in PARSERS
-
-    def test_ocr_registry_has_local_backends(self):
-        from petey.extract import OCR_BACKENDS
-        assert "tesseract" in OCR_BACKENDS
-
-    def test_ocr_registry_has_plugin_backends(self):
-        from petey.extract import OCR_BACKENDS
-        assert "mistral" in OCR_BACKENDS
-
-    def test_ocr_registry_has_api_backends(self):
-        from petey.extract import OCR_BACKENDS
-        assert "chandra" in OCR_BACKENDS
 
     def test_llm_registry_has_builtins(self):
         from petey.extract import LLM_BACKENDS
@@ -1102,25 +901,14 @@ class TestRegistries:
             assert has_endpoint, f"{name} missing endpoint/endpoint_env"
             assert "api_key_env" in cfg, f"{name} missing api_key_env"
 
-    def test_api_ocr_config_valid(self):
-        from petey.extract import API_OCR_BACKENDS
-        for name, cfg in API_OCR_BACKENDS.items():
-            has_endpoint = "endpoint" in cfg or "endpoint_env" in cfg
-            assert has_endpoint, f"{name} missing endpoint/endpoint_env"
-            assert "api_key_env" in cfg, f"{name} missing api_key_env"
-
     def test_api_parsers_are_callable(self):
         from petey.extract import PARSERS
-        for name in ["marker"]:
+        for name in ["datalab"]:
             assert callable(PARSERS[name])
-
-    def test_api_ocr_are_callable(self):
-        from petey.extract import OCR_BACKENDS
-        assert callable(OCR_BACKENDS["chandra"])
 
     def test_local_parsers_are_sync(self):
         from petey.extract import PARSERS
-        for name in ["pymupdf", "pdfplumber", "tables", "tabula"]:
+        for name in ["pymupdf", "pdfplumber"]:
             assert not asyncio.iscoroutinefunction(
                 PARSERS[name]
             ), f"Parser '{name}' should be sync"
@@ -1132,37 +920,14 @@ class TestRegistries:
                 PARSERS[name]
             ), f"Parser '{name}' should be async"
 
-    def test_local_ocr_backends_are_sync(self):
-        from petey.extract import OCR_BACKENDS
-        for name in ["tesseract"]:
-            assert not asyncio.iscoroutinefunction(
-                OCR_BACKENDS[name]
-            ), f"OCR '{name}' should be sync"
-
-    def test_plugin_ocr_backends_are_callable(self):
-        from petey.extract import OCR_BACKENDS, PLUGIN_OCR_BACKENDS
-        for name in PLUGIN_OCR_BACKENDS:
-            assert callable(
-                OCR_BACKENDS[name]
-            ), f"Plugin OCR '{name}' should be callable"
-
-    def test_api_ocr_backends_are_async(self):
-        from petey.extract import (
-            OCR_BACKENDS, API_OCR_BACKENDS,
-        )
-        for name in API_OCR_BACKENDS:
-            assert asyncio.iscoroutinefunction(
-                OCR_BACKENDS[name]
-            ), f"OCR '{name}' should be async"
-
-    def test_marker_uses_correct_endpoint(self):
+    def test_datalab_uses_correct_endpoint(self):
         from petey.extract import API_PARSERS
-        assert "marker" in API_PARSERS
-        assert "/marker" in API_PARSERS["marker"]["endpoint"]
+        assert "datalab" in API_PARSERS
+        assert "datalab.to" in API_PARSERS["datalab"]["endpoint"]
 
-    def test_chandra_uses_correct_endpoint(self):
-        from petey.extract import API_OCR_BACKENDS
-        assert "/chandra" in API_OCR_BACKENDS["chandra"]["endpoint"]
+    def test_marker_alias_exists(self):
+        from petey.extract import PARSERS
+        assert "marker" in PARSERS
 
 
 class TestLLMBackendConfig:
@@ -1197,56 +962,24 @@ class TestApiIntegration:
     """Test that API backends integrate with extract_text."""
 
     @patch.dict(os.environ, {"DATALAB_API_KEY": "test-key"})
-    def test_marker_parser_via_extract_text(self, tmp_path):
+    def test_datalab_parser_via_extract_text(self, tmp_path):
         pdf = tmp_path / "test.pdf"
         pdf.write_bytes(b"fake pdf")
         with patch(
             "petey.extract._api_post",
             new_callable=AsyncMock,
-            return_value="marker output",
+            return_value="datalab output",
         ):
             text = extract_text(
-                str(pdf), parser="marker",
+                str(pdf), parser="datalab",
             )
-        assert text == "marker output"
-
-    @patch.dict(os.environ, {"DATALAB_API_KEY": "test-key"})
-    def test_chandra_ocr_via_extract_text(self, tmp_path):
-        import fitz
-        doc = fitz.open()
-        doc.new_page()
-        blank_pdf = tmp_path / "blank.pdf"
-        doc.save(str(blank_pdf))
-
-        with patch(
-            "petey.extract._api_post",
-            new_callable=AsyncMock,
-            return_value="chandra ocr",
-        ):
-            text = extract_text(
-                str(blank_pdf),
-                parser="pdfplumber",
-                ocr_backend="chandra",
-            )
-        assert "chandra ocr" in text
+        assert text == "datalab output"
 
     def test_unknown_parser_raises(self, tmp_path):
         pdf = tmp_path / "test.pdf"
         pdf.write_bytes(b"fake pdf")
         with pytest.raises(ValueError, match="not found"):
             extract_text(str(pdf), parser="buttparse")
-
-    def test_unknown_ocr_raises(self, tmp_path):
-        import fitz
-        doc = fitz.open()
-        doc.new_page()
-        blank_pdf = tmp_path / "blank.pdf"
-        doc.save(str(blank_pdf))
-
-        with pytest.raises(ValueError, match="not found"):
-            extract_text(
-                str(blank_pdf), parser="pdfplumber",
-                ocr_backend="buttocr")
 
 
 # -----------------------------------------------------------
@@ -1415,7 +1148,7 @@ class TestExtractAsyncConcurrency:
             calls["api"] += 1
             return orig_api(self)
 
-        async def fake_parse(path, parser, ocr):
+        async def fake_parse(path, parser):
             return "fake text from API parser"
 
         with patch.object(
@@ -1454,8 +1187,8 @@ class TestRegistryDispatchConcurrency:
     """Verify registry entries route through correct pool."""
 
     @patch.dict(os.environ, {"DATALAB_API_KEY": "test-key"})
-    def test_marker_parser_routes_to_api_pool(self, tmp_path):
-        """parser='marker' (async registry entry) should
+    def test_datalab_parser_routes_to_api_pool(self, tmp_path):
+        """parser='datalab' (async registry entry) should
         go through run() → API pool, not run_cpu()."""
         from petey.extract import extract_async
         from petey.concurrency import ConcurrencyManager
@@ -1488,7 +1221,7 @@ class TestRegistryDispatchConcurrency:
                 with patch(
                     "petey.extract._api_post",
                     new_callable=AsyncMock,
-                    return_value="marker text",
+                    return_value="datalab text",
                 ):
                     with patch(
                         "petey.extract._make_client",
@@ -1497,15 +1230,15 @@ class TestRegistryDispatchConcurrency:
                         asyncio.run(
                             extract_async(
                                 str(pdf), M,
-                                parser="marker",
+                                parser="datalab",
                             )
                         )
 
         assert calls["run"] >= 1, (
-            "marker (async) should route through run()"
+            "datalab (async) should route through run()"
         )
         assert calls["run_cpu"] == 0, (
-            "marker should NOT use run_cpu"
+            "datalab should NOT use run_cpu"
         )
 
     @patch.dict(
@@ -1769,7 +1502,7 @@ class TestExtractPagesAsyncRegistry:
 
     @patch.dict(os.environ, {"DATALAB_API_KEY": "k"})
     def test_api_parser_uses_run(self):
-        """parser='marker' should go through mgr.run()
+        """parser='datalab' should go through mgr.run()
         (API pool) via subsetting."""
         from petey.extract import extract_pages_async
         from petey.concurrency import ConcurrencyManager
@@ -1799,7 +1532,7 @@ class TestExtractPagesAsyncRegistry:
                 with patch(
                     "petey.extract._api_post",
                     new_callable=AsyncMock,
-                    return_value="marker text",
+                    return_value="datalab text",
                 ):
                     with patch(
                         "petey.extract._make_client",
@@ -1808,15 +1541,15 @@ class TestExtractPagesAsyncRegistry:
                         asyncio.run(
                             extract_pages_async(
                                 str(MCI_PDF), M,
-                                parser="marker",
+                                parser="datalab",
                             )
                         )
 
         assert calls["run"] >= 1, (
-            "marker should route through run()"
+            "datalab should route through run()"
         )
         assert calls["run_cpu"] == 0, (
-            "marker should NOT use run_cpu"
+            "datalab should NOT use run_cpu"
         )
 
     def test_unknown_parser_raises(self):
@@ -2006,26 +1739,6 @@ class TestBackendOptions:
         assert kwargs["lang"] == "fr"
         assert kwargs["dpi"] == 300
 
-    def test_ocr_options_passed(self):
-        from petey.extract import OCR_THRESHOLD
-        mock_parser = MagicMock(return_value=["x"])
-        mock_ocr = MagicMock(return_value="ocr text")
-        with patch.dict(
-            "petey.extract.PARSERS", {"mock": mock_parser},
-        ):
-            with patch.dict(
-                "petey.extract.OCR_BACKENDS",
-                {"mock_ocr": mock_ocr},
-            ):
-                extract_text_pages(
-                    str(MCI_PDF), parser="mock",
-                    ocr_backend="mock_ocr",
-                    ocr_options={"languages": ["en", "fr"]},
-                )
-        mock_ocr.assert_called_once()
-        _, kwargs = mock_ocr.call_args
-        assert kwargs["languages"] == ["en", "fr"]
-
 
 # ---------------------------------------------------------------------------
 # Fireworks / DeepSeek litellm routing
@@ -2093,3 +1806,300 @@ class TestEnumCaseInsensitive:
         model = build_model(spec)
         with pytest.raises(ValidationError):
             model(status="invalid")
+
+
+# ---------------------------------------------------------------------------
+# _parse_page_range
+# ---------------------------------------------------------------------------
+
+class TestParsePageRange:
+    def test_single_page(self):
+        from petey.extract import _parse_page_range
+        assert _parse_page_range("3", 10) == [2]
+
+    def test_range(self):
+        from petey.extract import _parse_page_range
+        assert _parse_page_range("2-5", 10) == [1, 2, 3, 4]
+
+    def test_comma_list(self):
+        from petey.extract import _parse_page_range
+        assert _parse_page_range("1,3,5", 10) == [0, 2, 4]
+
+    def test_mixed(self):
+        from petey.extract import _parse_page_range
+        assert _parse_page_range("1,3-5,8", 10) == [0, 2, 3, 4, 7]
+
+    def test_clamps_to_total(self):
+        from petey.extract import _parse_page_range
+        result = _parse_page_range("1-100", 5)
+        assert result == [0, 1, 2, 3, 4]
+
+
+# ---------------------------------------------------------------------------
+# infer_schema_async — page selection
+# ---------------------------------------------------------------------------
+
+class _OpenAILike:
+    """Minimal spec for an OpenAI-style raw client (no .messages)."""
+    class _Chat:
+        class _Completions:
+            async def create(self, **kw): ...
+        completions = _Completions()
+    chat = _Chat()
+
+
+def _mock_openai_raw_client(response_json: str):
+    """Build a mock that looks like an OpenAI raw client."""
+    msg = MagicMock()
+    msg.content = response_json
+    choice = MagicMock()
+    choice.message = msg
+    resp = MagicMock()
+    resp.choices = [choice]
+    raw = MagicMock(spec=_OpenAILike)
+    raw.chat.completions.create = AsyncMock(return_value=resp)
+    client = MagicMock()
+    client.client = raw
+    return client, raw
+
+
+def _mock_anthropic_raw_client(response_json: str):
+    """Build a mock that looks like an Anthropic raw client."""
+    block = MagicMock()
+    block.text = response_json
+    resp = MagicMock()
+    resp.content = [block]
+    raw = MagicMock()
+    raw.messages = MagicMock()
+    raw.messages.create = AsyncMock(return_value=resp)
+    client = MagicMock()
+    client.client = raw
+    return client, raw
+
+
+DUMMY_SCHEMA_JSON = '{"name": "test", "mode": "table", "fields": {"f": {"type": "string"}}}'
+
+
+class TestInferSchemaPageSelection:
+    """Test that infer_schema_async sends the right pages to the LLM."""
+
+    def _run(self, **kwargs):
+        from petey.extract import infer_schema_async
+        client, raw = _mock_openai_raw_client(DUMMY_SCHEMA_JSON)
+        with patch("petey.extract._make_client", return_value=client):
+            result = asyncio.run(
+                infer_schema_async(str(MCI_PDF), api_key="k", **kwargs)
+            )
+        # Return the user message sent to the LLM
+        call_kwargs = raw.chat.completions.create.call_args
+        return call_kwargs.kwargs["messages"][1]["content"]
+
+    def test_no_page_range_sends_first_pages(self):
+        """Without page_range, sends first max_pages pages."""
+        pages = extract_text_pages(str(MCI_PDF))
+        msg = self._run(max_pages=1)
+        # Should contain page 1 content
+        assert pages[0][:50] in msg
+
+    def test_page_range_selects_pages(self):
+        """page_range='1' should only send page 1."""
+        pages = extract_text_pages(str(MCI_PDF))
+        msg = self._run(page_range="1", max_pages=2)
+        assert pages[0][:50] in msg
+
+    def test_header_pages_prepended_with_separator(self):
+        """header_pages=1 should prepend header with HEADER END marker."""
+        msg = self._run(header_pages=1, max_pages=1)
+        assert "---HEADER END---" in msg
+
+    def test_no_header_pages_no_separator(self):
+        """Without header_pages, no HEADER END marker."""
+        msg = self._run(header_pages=0, max_pages=2)
+        assert "---HEADER END---" not in msg
+
+    def test_page_range_with_header_pages(self):
+        """page_range='1-2' with header_pages=1: page 1 is header,
+        page 2 is content."""
+        pages = extract_text_pages(str(MCI_PDF))
+        if len(pages) < 2:
+            pytest.skip("test PDF has only 1 page")
+        msg = self._run(page_range="1-2", header_pages=1, max_pages=1)
+        assert "---HEADER END---" in msg
+        # Header is page 1 content, content is page 2
+        assert pages[0][:50] in msg
+        assert pages[1][:50] in msg
+
+
+class TestInferSchemaClientRouting:
+    """Test that infer_schema_async uses the right API for each provider."""
+
+    def test_openai_client_uses_chat_completions(self):
+        from petey.extract import infer_schema_async
+        client, raw = _mock_openai_raw_client(DUMMY_SCHEMA_JSON)
+        with patch("petey.extract._make_client", return_value=client):
+            asyncio.run(
+                infer_schema_async(str(MCI_PDF), api_key="k")
+            )
+        raw.chat.completions.create.assert_called_once()
+
+    def test_anthropic_client_uses_messages(self):
+        from petey.extract import infer_schema_async
+        client, raw = _mock_anthropic_raw_client(DUMMY_SCHEMA_JSON)
+        with patch("petey.extract._make_client", return_value=client):
+            asyncio.run(
+                infer_schema_async(str(MCI_PDF), api_key="k")
+            )
+        raw.messages.create.assert_called_once()
+
+    def test_anthropic_passes_system_separately(self):
+        """Anthropic client should get system as a kwarg, not in messages."""
+        from petey.extract import infer_schema_async, INFER_SCHEMA_SYSTEM
+        client, raw = _mock_anthropic_raw_client(DUMMY_SCHEMA_JSON)
+        with patch("petey.extract._make_client", return_value=client):
+            asyncio.run(
+                infer_schema_async(str(MCI_PDF), api_key="k")
+            )
+        call_kwargs = raw.messages.create.call_args.kwargs
+        assert call_kwargs["system"] == INFER_SCHEMA_SYSTEM
+        # Messages should only have user role, no system
+        for m in call_kwargs["messages"]:
+            assert m["role"] != "system"
+
+
+# ---------------------------------------------------------------------------
+# extract_pages_async — header fallback
+# ---------------------------------------------------------------------------
+
+class TestExtractPagesHeaderFallback:
+    """When header_pages >= content pages, headers become content."""
+
+    def test_single_page_with_header_pages_1(self):
+        """1-page PDF with header_pages=1: page should be extracted
+        as content (not skipped)."""
+        from petey.extract import extract_pages_async
+        from pydantic import BaseModel
+
+        class M(BaseModel):
+            field: str | None = None
+
+        with patch(
+            "petey.extract._make_client",
+            return_value=_mock_llm_client(),
+        ):
+            results = asyncio.run(
+                extract_pages_async(
+                    str(MCI_PDF), M,
+                    header_pages=1,
+                    parser="pymupdf",
+                )
+            )
+        # Should have at least 1 result (not empty)
+        assert len(results) >= 1
+        # Should not have header prepended (fallback clears it)
+        # Just verify we got results, not an empty list
+
+    def test_two_page_with_header_pages_1(self):
+        """2-page PDF with header_pages=1 where content <= headers:
+        both pages should be content chunks."""
+        from petey.extract import extract_pages_async
+        from pydantic import BaseModel
+        import tempfile
+        import fitz
+
+        # Create a 2-page test PDF
+        doc = fitz.open()
+        for i in range(2):
+            page = doc.new_page()
+            page.insert_text((72, 72), f"Page {i+1} content")
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        doc.save(tmp.name)
+        doc.close()
+
+        class M(BaseModel):
+            field: str | None = None
+
+        # Return unique data per call to avoid dedup
+        call_count = {"n": 0}
+        def _unique_mock_client():
+            mock_result = MagicMock()
+            def _side_effect(**kw):
+                call_count["n"] += 1
+                r = MagicMock()
+                r.model_dump.return_value = {
+                    "field": f"value_{call_count['n']}",
+                }
+                return r
+            client = MagicMock()
+            client.chat.completions.create = AsyncMock(
+                side_effect=_side_effect,
+            )
+            return client
+
+        try:
+            with patch(
+                "petey.extract._make_client",
+                return_value=_unique_mock_client(),
+            ):
+                results = asyncio.run(
+                    extract_pages_async(
+                        tmp.name, M,
+                        header_pages=1,
+                        parser="pymupdf",
+                    )
+                )
+            # Fallback: both pages become content → 2 chunks
+            assert len(results) == 2
+        finally:
+            os.unlink(tmp.name)
+
+    def test_many_pages_no_fallback(self):
+        """10-page PDF with header_pages=1: no fallback, 9 content
+        chunks."""
+        from petey.extract import extract_pages_async
+        from pydantic import BaseModel
+        import tempfile
+        import fitz
+
+        doc = fitz.open()
+        for i in range(10):
+            page = doc.new_page()
+            page.insert_text((72, 72), f"Page {i+1} content")
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        doc.save(tmp.name)
+        doc.close()
+
+        class M(BaseModel):
+            field: str | None = None
+
+        # Return unique data per call to avoid dedup
+        call_count = {"n": 0}
+        def _unique_mock_client():
+            def _side_effect(**kw):
+                call_count["n"] += 1
+                r = MagicMock()
+                r.model_dump.return_value = {
+                    "field": f"value_{call_count['n']}",
+                }
+                return r
+            client = MagicMock()
+            client.chat.completions.create = AsyncMock(
+                side_effect=_side_effect,
+            )
+            return client
+
+        try:
+            with patch(
+                "petey.extract._make_client",
+                return_value=_unique_mock_client(),
+            ):
+                results = asyncio.run(
+                    extract_pages_async(
+                        tmp.name, M,
+                        header_pages=1,
+                        parser="pymupdf",
+                    )
+                )
+            # 9 content pages, no fallback
+            assert len(results) == 9
+        finally:
+            os.unlink(tmp.name)
