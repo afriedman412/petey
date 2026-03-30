@@ -5,10 +5,9 @@ Configure via environment variables or pass explicitly.
 Pipeline architecture::
 
     PDF
-     └─ TextExtractor      (pymupdf | pdfplumber | tabula | marker | liteparse | docling | …)
-          └─ OCRBackend    (tesseract | mistral | chandra | none)
-               └─ LLMBackend  (openai | anthropic | litellm)
-                    └─ Output  (csv | json | jsonl)
+     └─ Parser       (pymupdf | pdfplumber | datalab | unstructured | …)
+          └─ LLM     (openai | anthropic | litellm)
+               └─ Output  (csv | json | jsonl)
 
 Each layer is swappable via parameters on the public functions.
 """
@@ -40,18 +39,6 @@ TEXT_WARN_THRESHOLD = 50_000
 SHORT_TEXT_THRESHOLD = 200  # warn before LLM if text is this short
 
 
-def _should_retry_with_ocr(data: dict) -> bool:
-    """Return True if extraction produced mostly null fields."""
-    fields = {
-        k: v for k, v in data.items()
-        if not k.startswith("_")
-    }
-    if not fields:
-        return False
-    null_count = sum(1 for v in fields.values() if v is None)
-    return null_count >= len(fields) * 0.8
-
-
 def _check_extraction_quality(
     data: dict,
     text: str,
@@ -64,32 +51,29 @@ def _check_extraction_quality(
     msgs = []
     prefix = f"[petey] {label}: " if label else "[petey] "
 
-    # Check if text was suspiciously short
     if len(text.strip()) < SHORT_TEXT_THRESHOLD:
         msgs.append(
             f"{prefix}extracted text was very short "
-            f"({len(text.strip())} chars) — PDF may need OCR"
+            f"({len(text.strip())} chars) — try a different parser"
         )
 
-    # Check if most fields are null
-    if _should_retry_with_ocr(data):
-        fields = {
-            k: v for k, v in data.items()
-            if not k.startswith("_")
-        }
+    fields = {
+        k: v for k, v in data.items()
+        if not k.startswith("_")
+    }
+    if fields:
         null_count = sum(
             1 for v in fields.values() if v is None
         )
-        msgs.append(
-            f"{prefix}{null_count}/{len(fields)} fields "
-            f"are null"
-        )
+        if null_count >= len(fields) * 0.8:
+            msgs.append(
+                f"{prefix}{null_count}/{len(fields)} fields "
+                f"are null"
+            )
     return msgs
 
 
 # --- PDF text extraction backends ---
-
-OCR_THRESHOLD = 100  # chars below which pymupdf output is treated as empty
 
 
 def _extract_text_pages_pymupdf(pdf_path: str) -> list[str]:
@@ -109,39 +93,6 @@ def _extract_text_pages_pymupdf(pdf_path: str) -> list[str]:
         pages = [page.get_text("text") for page in doc]
         doc.close()
         return pages
-
-
-def _extract_text_pages_tables(pdf_path: str) -> list[str]:
-    """Extract per-page text using PyMuPDF's table detection.
-
-    Detects bordered tables and converts them to TSV.  Falls back to plain
-    text for pages without tables.
-    """
-    doc = fitz.open(pdf_path)
-    pages = []
-    for page in doc:
-        found = page.find_tables()
-        if found.tables:
-            parts = []
-            for table in found.tables:
-                rows = table.extract()
-                tsv = "\n".join(
-                    "\t".join(
-                        str(cell) if cell else "" for cell in row
-                    )
-                    for row in rows
-                    if any(cell for cell in row)
-                )
-                if tsv:
-                    parts.append(tsv)
-            text = (
-                "\n\n".join(parts) if parts
-                else page.get_text("text")
-            )
-        else:
-            text = page.get_text("text")
-        pages.append(text)
-    return pages
 
 
 def _extract_text_pages_pdfplumber(pdf_path: str) -> list[str]:
@@ -168,46 +119,6 @@ def _extract_text_pages_pdfplumber(pdf_path: str) -> list[str]:
                 or ""
             )
             pages.append(text)
-    return pages
-
-
-def _extract_text_pages_tabula(pdf_path: str) -> list[str]:
-    """Extract per-page text using tabula-py table detection.
-
-    Uses tabula-py to read tables as DataFrames, converts to TSV strings.
-    Falls back to pymupdf4llm markdown for pages with no detected tables.
-    Requires Java to be installed.
-    """
-    try:
-        import tabula
-    except ImportError:
-        raise ImportError(
-            "tabula-py is required for parser='tabula'. "
-            "Install it with: pip install petey[tabula]"
-        )
-    doc = fitz.open(pdf_path)
-    n_pages = len(doc)
-    pages = []
-    for page_num in range(1, n_pages + 1):
-        try:
-            dfs = tabula.read_pdf(
-                pdf_path, pages=page_num, multiple_tables=True,
-                silent=True,
-            )
-            if dfs:
-                parts = []
-                for df in dfs:
-                    tsv = df.to_csv(sep="\t", index=False)
-                    if tsv.strip():
-                        parts.append(tsv.strip())
-                if parts:
-                    pages.append("\n\n".join(parts))
-                    continue
-        except Exception:
-            pass
-        # Fallback to pymupdf4llm markdown
-        fallback = pymupdf4llm.to_markdown(pdf_path, pages=[page_num - 1])
-        pages.append(fallback)
     return pages
 
 
@@ -252,10 +163,10 @@ def _extract_text_pages_tabula(pdf_path: str) -> list[str]:
 #   "[].text"     — join text from each element in an array response
 
 API_PARSERS: dict[str, dict] = {
-    "marker": {
-        "name": "Marker",
+    "datalab": {
+        "name": "Datalab",
         "role": "parser",
-        "endpoint": "https://www.datalab.to/api/v1/marker",
+        "endpoint": "https://www.datalab.to/api/v1/convert",
         "api_key_env": "DATALAB_API_KEY",
         "auth_header": "X-API-Key",
         "params": {"output_format": "markdown"},
@@ -290,28 +201,6 @@ API_PARSERS: dict[str, dict] = {
         "poll_status_key": "status",
         "poll_done_value": "succeeded",
         "timeout": 120,
-    },
-}
-
-API_OCR_BACKENDS: dict[str, dict] = {
-    "chandra": {
-        "name": "Chandra",
-        "role": "ocr",
-        "endpoint": "https://www.datalab.to/api/v1/chandra",
-        "api_key_env": "DATALAB_API_KEY",
-        "auth_header": "X-API-Key",
-        "params": {"output_format": "markdown"},
-        "response_key": "markdown",
-        "poll": True,
-    },
-    "surya": {
-        "name": "Surya",
-        "role": "ocr",
-        "endpoint": "https://www.datalab.to/api/v1/ocr",
-        "api_key_env": "DATALAB_API_KEY",
-        "auth_header": "X-API-Key",
-        "response_key": "text",
-        "poll": True,
     },
 }
 
@@ -497,15 +386,6 @@ async def _parse_pdf_via_api(pdf_path: str, cfg: dict) -> list[str]:
     return [text] if text else [""]
 
 
-async def _ocr_page_via_api(page, cfg: dict) -> str:
-    """OCR a single fitz page by uploading it to a remote API."""
-    pix = page.get_pixmap(dpi=200)
-    img_bytes = pix.tobytes("png")
-    return await _api_post(
-        cfg, img_bytes, "page.png", "image/png",
-    )
-
-
 # --- Plugin registries ---
 #
 # Register local backends that live outside extract.py.  Each entry maps a
@@ -528,13 +408,6 @@ PLUGIN_PARSERS: dict[str, str] = {
     "unstructured": "petey.plugins.unstructured:extract_pages",
     "textract": "petey.plugins.textract:extract_pages",
     "google_documentai": "petey.plugins.google_documentai:extract_pages",
-}
-
-PLUGIN_OCR_BACKENDS: dict[str, str] = {
-    "mistral": "petey.plugins.mistral_ocr:ocr_page",
-    "easyocr": "petey.plugins.easyocr_backend:ocr_page",
-    "paddleocr": "petey.plugins.paddleocr_backend:ocr_page",
-    "google_vision": "petey.plugins.google_vision_ocr:ocr_page",
 }
 
 PLUGIN_LLM_BACKENDS: dict[str, str] = {}
@@ -587,40 +460,35 @@ def _make_plugin_loader(import_path: str):
 
 PARSERS = {
     "pymupdf": _extract_text_pages_pymupdf,
-    "tables": _extract_text_pages_tables,
     "pdfplumber": _extract_text_pages_pdfplumber,
-    "tabula": _extract_text_pages_tabula,
     **{name: _make_plugin_loader(path)
        for name, path in PLUGIN_PARSERS.items()},
     **{name: partial(_parse_pdf_via_api, cfg=cfg)
        for name, cfg in API_PARSERS.items()},
 }
 
+# Backward compatibility alias
+PARSERS["marker"] = PARSERS["datalab"]
+
 
 def extract_text(
     pdf_path: str,
     parser: str = "pymupdf",
-    ocr_fallback: bool = False,
-    ocr_backend: str = "none",
     parser_options: dict | None = None,
-    ocr_options: dict | None = None,
 ) -> str:
     """Extract all text from a PDF as a single string.
 
     Args:
         pdf_path: Path to the PDF file.
         parser: Text extraction backend — see ``PARSERS`` registry.
-        ocr_fallback: Deprecated. Use ``ocr_backend="tesseract"`` instead.
-        ocr_backend: OCR fallback when text layer is empty/short.
         parser_options: Extra kwargs passed to the parser callable.
-        ocr_options: Extra kwargs passed to the OCR callable.
 
     Returns:
         Extracted text as a single string.
     """
     pages = extract_text_pages(
-        pdf_path, parser, ocr_fallback, ocr_backend,
-        parser_options=parser_options, ocr_options=ocr_options,
+        pdf_path, parser,
+        parser_options=parser_options,
     )
     return "\n\n".join(pages)
 
@@ -628,28 +496,19 @@ def extract_text(
 def extract_text_pages(
     pdf_path: str,
     parser: str = "pymupdf",
-    ocr_fallback: bool = False,
-    ocr_backend: str = "none",
     parser_options: dict | None = None,
-    ocr_options: dict | None = None,
 ) -> list[str]:
     """Extract text from each page of a PDF separately.
 
     Args:
         pdf_path: Path to the PDF file.
         parser: Text extraction backend — see ``PARSERS`` registry.
-        ocr_fallback: Deprecated. Use ``ocr_backend="tesseract"`` instead.
-        ocr_backend: OCR fallback when text layer is empty/short —
-            see ``OCR_BACKENDS`` registry.
         parser_options: Extra kwargs passed to the parser callable.
-        ocr_options: Extra kwargs passed to the OCR callable.
 
     Returns:
         List of strings, one per page.
     """
-    ocr_backend = _resolve_ocr_backend(ocr_fallback, ocr_backend)
     _p_opts = parser_options or {}
-    _o_opts = ocr_options or {}
 
     fn = PARSERS.get(parser)
     if fn is None:
@@ -657,12 +516,6 @@ def extract_text_pages(
             f"Parser '{parser}' not found. "
             f"Available parsers: {', '.join(PARSERS)}"
         )
-    # When an external OCR backend is requested and the user hasn't
-    # explicitly chosen a parser, use pdfplumber instead of pymupdf4llm
-    # so that scanned pages are left empty for the external OCR to handle
-    # (pymupdf4llm runs its own built-in OCR which can't be fully disabled).
-    if parser == "pymupdf" and ocr_backend != "none":
-        fn = PARSERS["pdfplumber"]
     if asyncio.iscoroutinefunction(fn):
         try:
             loop = asyncio.get_running_loop()
@@ -678,109 +531,8 @@ def extract_text_pages(
     else:
         pages = fn(pdf_path, **_p_opts)
 
-    # Apply OCR fallback to pages with insufficient text
-    if ocr_backend != "none":
-        doc = None
-        for i, text in enumerate(pages):
-            if len(text.strip()) < OCR_THRESHOLD:
-                if doc is None:
-                    doc = fitz.open(pdf_path)
-                pages[i] = _ocr_page(
-                    doc[i], ocr_backend, pdf_path,
-                    **_o_opts,
-                )
-
     return pages
 
-
-def _resolve_ocr_backend(ocr_fallback: bool, ocr_backend: str) -> str:
-    """Normalise the deprecated ``ocr_fallback`` flag into an ocr_backend."""
-    if ocr_fallback and ocr_backend == "none":
-        return "tesseract"
-    return ocr_backend
-
-
-def _ocr_page_tesseract(page) -> str:
-    """OCR a single fitz page using pytesseract."""
-    import pytesseract
-    from PIL import Image
-    import io
-    pix = page.get_pixmap(dpi=200)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    return pytesseract.image_to_string(img)
-
-
-# --- OCR backend registry ---
-# Each backend is a callable: (page: fitz.Page) -> str
-# Local backends are plain functions; API backends are built from config.
-
-OCR_BACKENDS = {
-    "tesseract": _ocr_page_tesseract,
-    **{name: _make_plugin_loader(path)
-       for name, path in PLUGIN_OCR_BACKENDS.items()},
-    **{name: partial(_ocr_page_via_api, cfg=cfg)
-       for name, cfg in API_OCR_BACKENDS.items()},
-}
-
-
-def _ocr_page(
-    page, ocr_backend: str = "tesseract",
-    pdf_path: str | None = None,
-    **ocr_options,
-) -> str:
-    """OCR a single fitz page.
-
-    Args:
-        page: A fitz page object.
-        ocr_backend: OCR backend — see ``OCR_BACKENDS`` registry.
-        pdf_path: Path to the source PDF (used by Mistral OCR).
-        **ocr_options: Extra kwargs passed to the OCR callable.
-
-    Returns:
-        Extracted text from the page.
-    """
-    fn = OCR_BACKENDS.get(ocr_backend)
-    if fn is None:
-        raise ValueError(
-            f"OCR backend '{ocr_backend}' not found. "
-            f"Available: {', '.join(OCR_BACKENDS)}"
-        )
-    if asyncio.iscoroutinefunction(fn):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None:
-            raise RuntimeError(
-                f"OCR backend '{ocr_backend}' is async. "
-                f"Use extract_async() or "
-                f"extract_pages_async() instead."
-            )
-        return asyncio.run(fn(page, **ocr_options))
-    return fn(page, **ocr_options)
-
-
-def _ocr_full(doc, pdf_path: str, ocr_backend: str) -> str:
-    """OCR all pages of an open fitz document."""
-    return "\n\n".join(
-        _ocr_page(page, ocr_backend, pdf_path) for page in doc
-    )
-
-
-def _ocr_full_doc(pdf_path: str) -> str:
-    """OCR all pages of a PDF using tesseract."""
-    doc = fitz.open(pdf_path)
-    pages = [_ocr_page_tesseract(page) for page in doc]
-    doc.close()
-    return "\n\n".join(pages)
-
-
-def _ocr_single_page(pdf_path: str, page_index: int) -> str:
-    """OCR a single page by index. Picklable for ProcessPoolExecutor."""
-    doc = fitz.open(pdf_path)
-    text = _ocr_page_tesseract(doc[page_index])
-    doc.close()
-    return text
 
 # --- LLM client ---
 
@@ -957,13 +709,10 @@ async def extract_async(
     api_key: str | None = None,
     instructions: str = "",
     parser: str = "pymupdf",
-    ocr_fallback: bool = False,
-    ocr_backend: str = "none",
     llm_backend: str | None = None,
     text: str | None = None,
     parse_fn=None,
     parser_options: dict | None = None,
-    ocr_options: dict | None = None,
 ) -> BaseModel:
     """Extract structured data from a single PDF.
 
@@ -975,11 +724,9 @@ async def extract_async(
         instructions: Additional extraction instructions appended to
             the system prompt.
         parser: Text extraction backend — see ``extract_text()``.
-        ocr_fallback: Deprecated. Use ``ocr_backend`` instead.
-        ocr_backend: OCR backend — see ``extract_text()``.
         llm_backend: LLM backend — see ``_make_client()``.
         text: Pre-extracted text (skips PDF parsing if provided).
-        parse_fn: Optional async callable(pdf_path, parser, ocr_backend)
+        parse_fn: Optional async callable(pdf_path, parser)
             -> str. When provided, replaces local text extraction.
 
     Returns:
@@ -990,11 +737,9 @@ async def extract_async(
     if text is None:
         if parse_fn is not None:
             text = await mgr.run(
-                parse_fn, pdf_path, parser, ocr_backend,
+                parse_fn, pdf_path, parser,
             )
         else:
-            # Look up the parser to dispatch correctly:
-            # async (API) → mgr.run, sync (local) → mgr.run_cpu
             parser_fn = PARSERS.get(parser)
             if parser_fn and asyncio.iscoroutinefunction(
                 parser_fn
@@ -1006,8 +751,7 @@ async def extract_async(
             else:
                 text = await mgr.run_cpu(
                     extract_text, pdf_path, parser,
-                    ocr_fallback, ocr_backend,
-                    _p_opts, ocr_options,
+                    _p_opts,
                 )
     if len(text) > TEXT_WARN_THRESHOLD:
         warnings.warn(
@@ -1017,7 +761,6 @@ async def extract_async(
             stacklevel=2,
         )
     client = _make_client(model, api_key, llm_backend)
-    ocr_retried = False
     label = os.path.basename(pdf_path)
     for attempt in range(5):
         try:
@@ -1033,29 +776,6 @@ async def extract_async(
                     max_tokens=4096,
                 )
                 data = result.model_dump(by_alias=True)
-                if (
-                    not ocr_retried
-                    and pdf_path
-                    and _should_retry_with_ocr(data)
-                ):
-                    ocr_retried = True
-                    print(
-                        f"[petey] {label}: mostly null "
-                        f"fields, retrying with OCR",
-                        flush=True,
-                    )
-                    try:
-                        ocr_text = await mgr.run_cpu(
-                            _ocr_full_doc, pdf_path,
-                        )
-                        if (
-                            ocr_text
-                            and len(ocr_text.strip()) > 50
-                        ):
-                            text = ocr_text
-                            continue
-                    except Exception:
-                        pass
                 for msg in _check_extraction_quality(
                     data, text, label=label,
                 ):
@@ -1079,23 +799,6 @@ async def extract_async(
                 )
                 await asyncio.sleep(wait)
                 continue
-            if not ocr_retried and pdf_path:
-                ocr_retried = True
-                print(
-                    "[petey] extraction failed, "
-                    "retrying with OCR fallback",
-                    flush=True,
-                )
-                try:
-                    ocr_text = await mgr.run_cpu(
-                        _ocr_full_doc, pdf_path,
-                    )
-                    if (ocr_text
-                            and len(ocr_text.strip()) > 50):
-                        text = ocr_text
-                        continue
-                except Exception:
-                    pass
             raise
 
 
@@ -1107,20 +810,16 @@ def extract(
     api_key: str | None = None,
     instructions: str = "",
     parser: str = "pymupdf",
-    ocr_fallback: bool = False,
-    ocr_backend: str = "none",
     llm_backend: str | None = None,
     parser_options: dict | None = None,
-    ocr_options: dict | None = None,
 ) -> BaseModel:
     """Sync wrapper around ``extract_async``. See that function for args."""
     return asyncio.run(
         extract_async(
             pdf_path, response_model,
             model=model, api_key=api_key, instructions=instructions,
-            parser=parser, ocr_fallback=ocr_fallback,
-            ocr_backend=ocr_backend, llm_backend=llm_backend,
-            parser_options=parser_options, ocr_options=ocr_options,
+            parser=parser, llm_backend=llm_backend,
+            parser_options=parser_options,
         )
     )
 
@@ -1162,38 +861,63 @@ async def infer_schema_async(
     model: str = "gpt-4.1-mini",
     api_key: str | None = None,
     parser: str = "pymupdf",
-    ocr_fallback: bool = False,
-    ocr_backend: str = "none",
     llm_backend: str | None = None,
     max_pages: int = 2,
+    page_range: str | None = None,
+    header_pages: int = 0,
 ) -> dict:
     """Analyze a PDF and suggest an extraction schema.
 
-    Reads the first ``max_pages`` pages, sends the text to
-    the LLM, and returns a schema spec dict compatible with
-    ``build_model()``.
+    Reads up to ``max_pages`` content pages (plus any header
+    pages), sends the text to the LLM, and returns a schema
+    spec dict compatible with ``build_model()``.
+
+    When ``page_range`` is set, header pages are taken from
+    the start of that range (not the start of the document).
 
     Args:
         pdf_path: Path to the PDF file.
         model: LLM model ID.
         api_key: Optional API key override.
         parser: Text extraction backend.
-        ocr_fallback: Fall back to OCR for low-text pages.
-        ocr_backend: OCR backend name.
         llm_backend: LLM backend override.
-        max_pages: Number of pages to sample (default 2).
+        max_pages: Number of content pages to sample (default 2).
+        page_range: Optional page range string (e.g. "5-10").
+            1-indexed, same format as extraction.
+        header_pages: Number of leading pages within the range
+            to treat as headers (prepended separately).
 
     Returns:
         Schema spec dict with name, record_type, fields, etc.
     """
     import json as _json
 
-    pages = extract_text_pages(
-        pdf_path, parser,
-        ocr_fallback=ocr_fallback, ocr_backend=ocr_backend,
+    all_pages = extract_text_pages(pdf_path, parser)
+    total = len(all_pages)
+
+    if page_range:
+        indices = _parse_page_range(page_range, total)
+    else:
+        indices = list(range(total))
+
+    header_indices = indices[:header_pages]
+    content_indices = indices[header_pages:]
+
+    header_text = ""
+    if header_indices:
+        header_text = (
+            "\n\n---PAGE BREAK---\n\n".join(
+                all_pages[i] for i in header_indices
+            )
+            + "\n\n---HEADER END---\n\n"
+        )
+
+    sample_pages = [
+        all_pages[i] for i in content_indices[:max_pages]
+    ]
+    sample = header_text + "\n\n---PAGE BREAK---\n\n".join(
+        sample_pages
     )
-    sample_pages = pages[:max_pages]
-    sample = "\n\n---PAGE BREAK---\n\n".join(sample_pages)
 
     client = _make_client(model, api_key, llm_backend)
 
@@ -1203,20 +927,28 @@ async def infer_schema_async(
         "Analyze this document and suggest a schema:"
         f"\n\n{sample}"
     )
-    resp = await raw.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": INFER_SCHEMA_SYSTEM},
-            {"role": "user", "content": user_msg},
-        ],
-        temperature=0,
-        max_tokens=4096,
-    )
 
-    # Extract text content from response
-    if hasattr(resp, "content"):
+    if hasattr(raw, "messages"):
+        # Anthropic client
+        resp = await raw.messages.create(
+            model=model,
+            system=INFER_SCHEMA_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+            temperature=0,
+            max_tokens=4096,
+        )
         content = resp.content[0].text
     else:
+        # OpenAI-compatible client
+        resp = await raw.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": INFER_SCHEMA_SYSTEM},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+            max_tokens=4096,
+        )
         content = resp.choices[0].message.content
 
     # Parse JSON (handle markdown code blocks)
@@ -1281,7 +1013,6 @@ def _subset_pdf(pdf_path: str, page_indices: list[int]) -> str:
     return tmp.name
 
 
-
 async def extract_pages_async(
     pdf_path: str,
     response_model: type[BaseModel],
@@ -1294,20 +1025,14 @@ async def extract_pages_async(
     on_result=None,
     on_parse=None,
     parser: str = "pymupdf",
-    ocr_backend: str = "none",
     llm_backend: str | None = None,
     header_pages: int = 0,
     page_range: str | None = None,
     parse_multiplier: int = 5,
     parse_fn=None,
     parser_options: dict | None = None,
-    ocr_options: dict | None = None,
 ) -> list[dict]:
     """Split a PDF into page chunks and extract each concurrently.
-
-    Parsing and LLM extraction are pipelined: each page is parsed
-    individually and its LLM call is launched immediately, so parsing
-    page N and extracting page N-1 happen in parallel.
 
     Args:
         pdf_path: Path to the PDF file.
@@ -1319,21 +1044,17 @@ async def extract_pages_async(
         concurrency: Max concurrent API calls.
         on_result: Optional callback(chunk_label, data_dict) called
             as each chunk's LLM extraction completes.
-        on_parse: Optional callback(chunk_label, total_chunks) called
-            as each chunk's text is parsed from the PDF.
-        parser: Text extraction backend — see ``extract_text()``.
-        ocr_backend: OCR backend — see ``extract_text()``.
+        on_parse: Optional callback(chunk_label, total_chunks)
+            called as each chunk's text is parsed from the PDF.
+        parser: Text extraction backend.
         llm_backend: LLM backend — see ``_make_client()``.
-        header_pages: Number of leading pages to treat as a header.
-            Their text is prepended to every chunk for context.
+        header_pages: Number of leading pages to treat as a
+            header. Their text is prepended to every chunk.
         page_range: Optional page range string (e.g. "2-5" or
-            "1,3,5-7"). 1-indexed. If omitted, all non-header
-            pages are processed.
-        parse_fn: Optional async callable(pdf_path, page_index, parser,
-            ocr_backend) -> str. When provided, replaces local
-            page-level text extraction (no ProcessPoolExecutor used).
-        parser_options: Extra kwargs passed to the parser callable.
-        ocr_options: Extra kwargs passed to the OCR callable.
+            "1,3,5-7"). 1-indexed.
+        parse_fn: Optional async callable(pdf_path, page_index,
+            parser) -> str. Replaces local page-level extraction.
+        parser_options: Extra kwargs passed to the parser.
 
     Returns:
         List of result dicts (with _page and optionally _error).
@@ -1408,9 +1129,12 @@ async def extract_pages_async(
         )
 
     # If all pages are headers (e.g. 1-page PDF with
-    # header_pages=1), treat header pages as content too
-    if not content_indices and total_pages > 0:
+    # header_pages=1) or header pages outnumber content pages,
+    # include header pages as content too so their data gets
+    # extracted (not just prepended as context).
+    if total_pages > 0 and len(content_indices) <= header_pages:
         content_indices = list(range(total_pages))
+        header_text = ""
 
     # Build chunk index groups (for pages_per_chunk > 1)
     chunk_groups = []
@@ -1477,7 +1201,6 @@ async def extract_pages_async(
 
         async with mgr.api():
             data = None
-            ocr_retried = False
             for attempt in range(5):
                 try:
                     result = (
@@ -1493,48 +1216,6 @@ async def extract_pages_async(
                     )
                     data = result.model_dump(by_alias=True)
                     data["_page"] = label
-                    if (
-                        not ocr_retried
-                        and _should_retry_with_ocr(data)
-                    ):
-                        ocr_retried = True
-                        print(
-                            f"[petey] {label}: mostly "
-                            f"null fields, retrying "
-                            f"with OCR",
-                            flush=True,
-                        )
-                        try:
-                            ocr_pages = (
-                                await asyncio.gather(*[
-                                    mgr.run_cpu(
-                                        _ocr_single_page,
-                                        pdf_path, i,
-                                    )
-                                    for i in idx_slice
-                                ])
-                            )
-                            ocr_text = "\n\n".join(
-                                ocr_pages
-                            )
-                            if (
-                                ocr_text
-                                and len(
-                                    ocr_text.strip()
-                                ) > 50
-                            ):
-                                text = (
-                                    (
-                                        header_text
-                                        + "\n\n"
-                                        + ocr_text
-                                    )
-                                    if header_text
-                                    else ocr_text
-                                )
-                                continue
-                        except Exception:
-                            pass
                     for msg in _check_extraction_quality(
                         data, text, label=label,
                     ):
@@ -1559,51 +1240,6 @@ async def extract_pages_async(
                         )
                         await asyncio.sleep(wait)
                         continue
-                    if not ocr_retried:
-                        ocr_retried = True
-                        print(
-                            f"[petey] {label}: "
-                            f"extraction failed "
-                            f"({err_str[:80]}), "
-                            f"retrying with OCR",
-                            flush=True,
-                        )
-                        try:
-                            ocr_pages = (
-                                await asyncio.gather(*[
-                                    mgr.run_cpu(
-                                        _ocr_single_page,
-                                        pdf_path, i,
-                                    )
-                                    for i in idx_slice
-                                ])
-                            )
-                            ocr_text = "\n\n".join(
-                                ocr_pages
-                            )
-                            if (
-                                ocr_text
-                                and len(
-                                    ocr_text.strip()
-                                ) > 50
-                            ):
-                                text = (
-                                    (
-                                        header_text
-                                        + "\n\n"
-                                        + ocr_text
-                                    )
-                                    if header_text
-                                    else ocr_text
-                                )
-                                continue
-                        except Exception as ocr_err:
-                            print(
-                                f"[petey] {label}: "
-                                f"OCR fallback also "
-                                f"failed: {ocr_err}",
-                                flush=True,
-                            )
                     data = {
                         "_page": label,
                         "_error": err_str,
@@ -1657,12 +1293,9 @@ async def extract_batch(
     concurrency: int = 10,
     on_result=None,
     parser: str = "pymupdf",
-    ocr_fallback: bool = False,
-    ocr_backend: str = "none",
     llm_backend: str | None = None,
     parse_fn=None,
     parser_options: dict | None = None,
-    ocr_options: dict | None = None,
 ) -> list[dict]:
     """Extract from multiple PDFs concurrently.
 
@@ -1673,21 +1306,17 @@ async def extract_batch(
         api_key: Optional API key override.
         instructions: Additional extraction instructions.
         concurrency: Max concurrent API calls.
-        on_result: Optional callback(path, data_dict) called as
-            each file completes.
-        parser: Text extraction backend — see ``extract_text()``.
-        ocr_fallback: Deprecated. Use ``ocr_backend`` instead.
-        ocr_backend: OCR backend — see ``extract_text()``.
+        on_result: Optional callback(path, data_dict) called
+            as each file completes.
+        parser: Text extraction backend.
         llm_backend: LLM backend — see ``_make_client()``.
-        parse_fn: Optional async callable(pdf_path, parser,
-            ocr_backend) -> str. When provided, replaces local
-            text extraction.
-        parser_options: Extra kwargs passed to the parser callable.
-        ocr_options: Extra kwargs passed to the OCR callable.
+        parse_fn: Optional async callable(pdf_path, parser)
+            -> str. Replaces local text extraction.
+        parser_options: Extra kwargs passed to the parser.
 
     Returns:
-        List of result dicts (with _source_file and optionally
-        _error).
+        List of result dicts (with _source_file and
+        optionally _error).
     """
     _p_opts = parser_options or {}
     mgr = get_manager()
@@ -1705,7 +1334,7 @@ async def extract_batch(
         try:
             if parse_fn is not None:
                 text = await mgr.run(
-                    parse_fn, path, parser, ocr_backend,
+                    parse_fn, path, parser,
                 )
             elif parser_is_async:
                 pages = await mgr.run(
@@ -1715,8 +1344,7 @@ async def extract_batch(
             else:
                 text = await mgr.run_cpu(
                     extract_text, path, parser,
-                    ocr_fallback, ocr_backend,
-                    _p_opts, ocr_options,
+                    _p_opts,
                 )
             async with mgr.api():
                 result = (
@@ -1733,40 +1361,6 @@ async def extract_batch(
             data = result.model_dump(by_alias=True)
             fname = os.path.basename(path)
             data["_source_file"] = fname
-            if _should_retry_with_ocr(data):
-                print(
-                    f"[petey] {fname}: mostly null "
-                    f"fields, retrying with OCR",
-                    flush=True,
-                )
-                try:
-                    ocr_text = await mgr.run_cpu(
-                        _ocr_full_doc, path,
-                    )
-                    if (
-                        ocr_text
-                        and len(ocr_text.strip()) > 50
-                    ):
-                        async with mgr.api():
-                            result = (
-                                await client.chat
-                                .completions.create(
-                                    model=model,
-                                    response_model=(
-                                        response_model
-                                    ),
-                                    max_retries=2,
-                                    messages=_make_messages(
-                                        ocr_text,
-                                        instructions,
-                                    ),
-                                    temperature=0,
-                                )
-                            )
-                        data = result.model_dump(by_alias=True)
-                        data["_source_file"] = fname
-                except Exception:
-                    pass
             for msg in _check_extraction_quality(
                 data, text, label=fname,
             ):
@@ -1780,5 +1374,7 @@ async def extract_batch(
         if on_result:
             on_result(path, data)
 
-    await asyncio.gather(*[_process(p) for p in pdf_paths])
+    await asyncio.gather(
+        *[_process(p) for p in pdf_paths]
+    )
     return results

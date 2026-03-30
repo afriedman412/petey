@@ -21,9 +21,9 @@ import yaml
 from petey.schema import load_schema
 from petey.extract import (
     extract_batch, extract_pages_async, infer_schema,
-    PARSERS, OCR_BACKENDS, LLM_BACKENDS,
-    API_PARSERS, API_OCR_BACKENDS, PLUGIN_PARSERS,
-    PLUGIN_OCR_BACKENDS, PLUGIN_LLM_BACKENDS,
+    PARSERS, LLM_BACKENDS,
+    API_PARSERS, PLUGIN_PARSERS,
+    PLUGIN_LLM_BACKENDS,
 )
 
 
@@ -111,20 +111,7 @@ def main():
         choices=list(PARSERS.keys()),
         help=(
             "PDF text extraction backend "
-            "(default: from schema, or pymupdf; "
-            "table schemas default to tables)"
-        ),
-    )
-    ext.add_argument(
-        "--ocr-fallback", action="store_true",
-        help="Deprecated. Use --ocr tesseract instead.",
-    )
-    ext.add_argument(
-        "--ocr", dest="ocr_backend", default=None,
-        choices=["none"] + [k for k in OCR_BACKENDS if k != "none"],
-        help=(
-            "OCR backend for scanned pages "
-            "(default: from schema, or none)"
+            "(default: from schema, or pymupdf)"
         ),
     )
     mode_group = ext.add_mutually_exclusive_group()
@@ -173,11 +160,6 @@ def main():
         help="PDF text extraction backend",
     )
     inf.add_argument(
-        "--ocr", dest="ocr_backend", default="none",
-        choices=["none"] + [k for k in OCR_BACKENDS if k != "none"],
-        help="OCR backend for scanned pages",
-    )
-    inf.add_argument(
         "--output", "-o", default=None,
         help="Save schema to YAML file",
     )
@@ -189,7 +171,7 @@ def main():
     )
     lst.add_argument(
         "backend", nargs="?", default="all",
-        choices=["all", "parsers", "ocr", "llm"],
+        choices=["all", "parsers", "llm"],
         help="Which backends to list (default: all)",
     )
 
@@ -284,21 +266,12 @@ def run_extract(args):
 
     instructions = spec.get("instructions", "")
     parser_options = spec.get("parser_options") or None
-    ocr_options = spec.get("ocr_options") or None
 
-    # CLI overrides schema, schema overrides defaults
-    ocr_backend = (
-        args.ocr_backend
-        or spec.get("ocr")
-        or ("tesseract" if args.ocr_fallback else "none")
-    )
-
-    # Parser: CLI overrides schema; schema overrides default;
-    # table schemas default to "tables", query schemas to "pymupdf"
+    # Parser: CLI overrides schema; schema overrides default
     if args.parser is not None:
         parser = args.parser
     else:
-        parser = spec.get("parser", "tables" if is_table else "pymupdf")
+        parser = spec.get("parser", "pymupdf")
 
     # Auto-chunk by page for array/table schemas unless explicitly disabled
     pages_per_chunk = args.pages_per_chunk
@@ -309,8 +282,6 @@ def run_extract(args):
     extras = []
     if parser != "pymupdf":
         extras.append(f"parser={parser}")
-    if ocr_backend != "none":
-        extras.append(f"ocr={ocr_backend}")
     opts = f"concurrency={args.concurrency}"
     if extras:
         opts = ", ".join(extras) + ", " + opts
@@ -363,9 +334,7 @@ def run_extract(args):
                     concurrency=args.concurrency,
                     on_result=on_chunk,
                     parser=parser,
-                    ocr_backend=ocr_backend,
                     parser_options=parser_options,
-                    ocr_options=ocr_options,
                     header_pages=(
                         args.header_pages
                         if args.header_pages is not None
@@ -396,9 +365,7 @@ def run_extract(args):
                 concurrency=args.concurrency,
                 on_result=on_result,
                 parser=parser,
-                ocr_backend=ocr_backend,
                 parser_options=parser_options,
-                ocr_options=ocr_options,
             )
         )
 
@@ -468,7 +435,6 @@ def run_infer_schema(args):
         args.pdf,
         model=model,
         parser=args.parser,
-        ocr_backend=args.ocr_backend,
         max_pages=args.max_pages,
     )
 
@@ -506,7 +472,6 @@ def _backend_type(name, api_dict, plugin_dict):
 def run_list(args):
     sections = {
         "parsers": (PARSERS, API_PARSERS, PLUGIN_PARSERS),
-        "ocr": (OCR_BACKENDS, API_OCR_BACKENDS, PLUGIN_OCR_BACKENDS),
         "llm": (LLM_BACKENDS, {}, PLUGIN_LLM_BACKENDS),
     }
     show = (

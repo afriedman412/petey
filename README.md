@@ -28,27 +28,12 @@ Petey does the wiring for you. Just pass it your files and a schema that explain
 
 | Parser | Install | Best for |
 |--------|---------|----------|
-| `pymupdf` | included | Most documents. Reads embedded text directly. Fast, free, default. |
-| `pdfplumber` | included | Borderless tables. Layout-preserving spatial extraction. |
-| `tables` | included | Bordered tables. Uses PyMuPDF's table detection. |
-| `marker` | included | Complex/scanned layouts. Remote API via Datalab. Requires `DATALAB_API_KEY`. |
+| `pymupdf` | included | Most documents. Reads embedded text directly, auto-OCRs scanned pages. Fast, free, default. |
+| `pdfplumber` | included | Borderless tables. Layout-preserving spatial extraction. Text-only (no OCR). |
+| `datalab` | included | Scanned/complex layouts. Remote API via Datalab. Requires `DATALAB_API_KEY`. |
 | `unstructured` | included | General-purpose. Remote API. Requires `UNSTRUCTURED_API_KEY`. |
 
 See `petey list parsers` for all available parsers.
-
-## OCR Backends
-
-If a PDF has no embedded text (e.g. scanned documents), Petey falls back to OCR. Only triggered when extracted text is very short.
-
-| Backend | Install | How it works |
-|---------|---------|--------------|
-| `none` | — | No OCR. Default. |
-| `tesseract` | included | Local OCR. Requires Tesseract binary installed. |
-| `chandra` | included | Cloud OCR via Datalab. Requires `DATALAB_API_KEY`. |
-| `surya` | included | Cloud OCR via Datalab. Requires `DATALAB_API_KEY`. |
-| `mistral` | `pip install petey[mistral-ocr]` | Cloud OCR via Mistral. Requires `MISTRAL_API_KEY`. |
-
-See `petey list ocr` for all available backends.
 
 ## LLM Backends
 
@@ -127,7 +112,7 @@ All fields are nullable — Petey returns `null` for anything it can't find rath
 petey extract --schema invoice.yaml ./invoices/ -o results.csv
 
 # With options
-petey extract --schema schema.yaml --model claude-sonnet-4-6 --parser marker ./pdfs/
+petey extract --schema schema.yaml --model claude-sonnet-4-6 --parser datalab ./pdfs/
 
 # List available backends
 petey list parsers
@@ -140,7 +125,6 @@ petey list llm
 | `--schema / -s` | required | Path to YAML schema |
 | `--model / -m` | `gpt-4.1-mini` | LLM model ID |
 | `--parser` | `pymupdf` | Text extraction backend |
-| `--ocr` | `none` | OCR backend |
 | `--concurrency / -c` | `10` | Max concurrent API calls |
 | `--output / -o` | stdout | Output file path |
 | `--format / -f` | inferred | `csv`, `json`, or `jsonl` |
@@ -162,17 +146,14 @@ result = extract(
     "invoice.pdf",
     schema,
     model="claude-sonnet-4-6",
-    parser="marker",
-    ocr_backend="chandra",
+    parser="datalab",
 )
 ```
 
 ## Optional Dependencies
 
 ```bash
-pip install petey                    # Core (pymupdf, pdfplumber, tesseract, litellm)
-pip install petey[mistral-ocr]       # + Mistral OCR
-pip install petey[tabula]            # + Tabula table extraction (requires Java)
+pip install petey                    # Core (pymupdf, pdfplumber, litellm)
 pip install petey[unstructured]      # + Unstructured API client
 pip install petey[all]               # Everything
 ```
