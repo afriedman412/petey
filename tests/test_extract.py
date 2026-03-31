@@ -2266,3 +2266,133 @@ class TestInferSchemaVision:
             p for p in parts if p.get("type") == "image_url"
         ]
         assert len(image_parts) == 1
+
+
+# ---------------------------------------------------------------------------
+# JSON parsing robustness (infer_schema)
+# ---------------------------------------------------------------------------
+
+class TestInferSchemaJsonParsing:
+    """Test that infer_schema handles various LLM response formats."""
+
+    def _run_with_response(self, response_text):
+        from petey.extract import infer_schema_async
+        client, raw = _mock_openai_raw_client(response_text)
+        with patch("petey.extract._make_client", return_value=client):
+            return asyncio.run(
+                infer_schema_async(str(MCI_PDF), api_key="k")
+            )
+
+    def test_plain_json(self):
+        result = self._run_with_response(DUMMY_SCHEMA_JSON)
+        assert result["name"] == "test"
+
+    def test_json_in_code_block(self):
+        response = '```json\n' + DUMMY_SCHEMA_JSON + '\n```'
+        result = self._run_with_response(response)
+        assert result["name"] == "test"
+
+    def test_prose_before_code_block(self):
+        """4o-mini style: prose text then a code block."""
+        response = (
+            "Based on the document, here is a suggested schema:\n\n"
+            "```json\n" + DUMMY_SCHEMA_JSON + "\n```"
+        )
+        result = self._run_with_response(response)
+        assert result["name"] == "test"
+
+    def test_prose_before_and_after_code_block(self):
+        response = (
+            "Here's the schema:\n\n"
+            "```json\n" + DUMMY_SCHEMA_JSON + "\n```\n\n"
+            "Let me know if you'd like changes."
+        )
+        result = self._run_with_response(response)
+        assert result["name"] == "test"
+
+    def test_code_block_without_json_tag(self):
+        response = "```\n" + DUMMY_SCHEMA_JSON + "\n```"
+        result = self._run_with_response(response)
+        assert result["name"] == "test"
+
+    def test_empty_response_raises(self):
+        from petey.extract import infer_schema_async
+        client, raw = _mock_openai_raw_client("")
+        # Make the response content empty
+        raw.chat.completions.create.return_value.choices[
+            0
+        ].message.content = ""
+        with patch(
+            "petey.extract._make_client", return_value=client,
+        ):
+            with pytest.raises(ValueError, match="empty response"):
+                asyncio.run(
+                    infer_schema_async(str(MCI_PDF), api_key="k")
+                )
+
+    def test_none_response_raises(self):
+        from petey.extract import infer_schema_async
+        client, raw = _mock_openai_raw_client("")
+        raw.chat.completions.create.return_value.choices[
+            0
+        ].message.content = None
+        with patch(
+            "petey.extract._make_client", return_value=client,
+        ):
+            with pytest.raises(ValueError, match="empty response"):
+                asyncio.run(
+                    infer_schema_async(str(MCI_PDF), api_key="k")
+                )
+
+    def test_invalid_json_raises_with_preview(self):
+        from petey.extract import infer_schema_async
+        client, raw = _mock_openai_raw_client(
+            "This is not JSON at all"
+        )
+        with patch(
+            "petey.extract._make_client", return_value=client,
+        ):
+            with pytest.raises(ValueError, match="invalid JSON"):
+                asyncio.run(
+                    infer_schema_async(str(MCI_PDF), api_key="k")
+                )
+
+
+class TestInferSchemaVisionJsonParsing:
+    """Same JSON parsing tests for the vision path."""
+
+    def _run_with_response(self, response_text):
+        from petey.extract import infer_schema_vision_async
+        client, raw = _mock_openai_raw_client(response_text)
+        with patch(
+            "petey.extract._make_client", return_value=client,
+        ):
+            return asyncio.run(
+                infer_schema_vision_async(
+                    str(MCI_PDF), api_key="k",
+                )
+            )
+
+    def test_prose_before_code_block(self):
+        response = (
+            "Based on the document, here is a suggested schema:\n\n"
+            "```json\n" + DUMMY_SCHEMA_JSON + "\n```"
+        )
+        result = self._run_with_response(response)
+        assert result["name"] == "test"
+
+    def test_empty_response_raises(self):
+        from petey.extract import infer_schema_vision_async
+        client, raw = _mock_openai_raw_client("")
+        raw.chat.completions.create.return_value.choices[
+            0
+        ].message.content = ""
+        with patch(
+            "petey.extract._make_client", return_value=client,
+        ):
+            with pytest.raises(ValueError, match="empty response"):
+                asyncio.run(
+                    infer_schema_vision_async(
+                        str(MCI_PDF), api_key="k",
+                    )
+                )
