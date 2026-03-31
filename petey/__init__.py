@@ -10,6 +10,7 @@ from petey.extract import (
     extract_pages_async,
     infer_schema,
     infer_schema_async,
+    infer_schema_vision_async,
 )
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "extract_pages_async",
     "infer_schema",
     "infer_schema_async",
+    "infer_schema_vision_async",
 ]
