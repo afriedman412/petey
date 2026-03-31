@@ -2103,3 +2103,166 @@ class TestExtractPagesHeaderFallback:
             assert len(results) == 9
         finally:
             os.unlink(tmp.name)
+
+
+# ---------------------------------------------------------------------------
+# infer_schema_vision_async
+# ---------------------------------------------------------------------------
+
+class TestInferSchemaVision:
+    """Test vision-based schema inference."""
+
+    def test_openai_sends_image_url(self):
+        """OpenAI path should send image_url content parts."""
+        from petey.extract import infer_schema_vision_async
+        client, raw = _mock_openai_raw_client(DUMMY_SCHEMA_JSON)
+        with patch("petey.extract._make_client", return_value=client):
+            asyncio.run(
+                infer_schema_vision_async(str(MCI_PDF), api_key="k")
+            )
+        call_kwargs = raw.chat.completions.create.call_args.kwargs
+        messages = call_kwargs["messages"]
+        # Should have system + user messages
+        assert messages[0]["role"] == "system"
+        assert messages[1]["role"] == "user"
+        # User message should be a list of content parts
+        parts = messages[1]["content"]
+        assert isinstance(parts, list)
+        # Should contain at least one image_url part
+        image_parts = [p for p in parts if p.get("type") == "image_url"]
+        assert len(image_parts) >= 1
+        # Image should be base64 PNG
+        assert image_parts[0]["image_url"]["url"].startswith(
+            "data:image/png;base64,"
+        )
+
+    def test_anthropic_sends_image_blocks(self):
+        """Anthropic path should send image content blocks."""
+        from petey.extract import infer_schema_vision_async
+        client, raw = _mock_anthropic_raw_client(DUMMY_SCHEMA_JSON)
+        with patch("petey.extract._make_client", return_value=client):
+            asyncio.run(
+                infer_schema_vision_async(str(MCI_PDF), api_key="k")
+            )
+        call_kwargs = raw.messages.create.call_args.kwargs
+        assert call_kwargs["system"]  # system prompt passed separately
+        messages = call_kwargs["messages"]
+        assert messages[0]["role"] == "user"
+        parts = messages[0]["content"]
+        assert isinstance(parts, list)
+        # Should contain at least one image block
+        image_parts = [
+            p for p in parts if p.get("type") == "image"
+        ]
+        assert len(image_parts) >= 1
+        assert image_parts[0]["source"]["media_type"] == "image/png"
+        assert image_parts[0]["source"]["type"] == "base64"
+
+    def test_returns_valid_schema(self):
+        """Should return a parsed schema dict."""
+        from petey.extract import infer_schema_vision_async
+        client, raw = _mock_openai_raw_client(DUMMY_SCHEMA_JSON)
+        with patch("petey.extract._make_client", return_value=client):
+            result = asyncio.run(
+                infer_schema_vision_async(str(MCI_PDF), api_key="k")
+            )
+        assert result["name"] == "test"
+        assert "fields" in result
+
+    def test_page_range_limits_images(self):
+        """With page_range='1', should only send 1 image."""
+        from petey.extract import infer_schema_vision_async
+        client, raw = _mock_openai_raw_client(DUMMY_SCHEMA_JSON)
+        with patch("petey.extract._make_client", return_value=client):
+            asyncio.run(
+                infer_schema_vision_async(
+                    str(MCI_PDF), api_key="k",
+                    page_range="1", max_pages=2,
+                )
+            )
+        call_kwargs = raw.chat.completions.create.call_args.kwargs
+        parts = call_kwargs["messages"][1]["content"]
+        image_parts = [p for p in parts if p.get("type") == "image_url"]
+        assert len(image_parts) == 1
+
+    def test_header_pages_marked(self):
+        """Header pages should be labeled in the content."""
+        from petey.extract import infer_schema_vision_async
+        import tempfile
+        import fitz
+
+        # Create a 3-page test PDF
+        doc = fitz.open()
+        for i in range(3):
+            page = doc.new_page()
+            page.insert_text((72, 72), f"Page {i+1}")
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".pdf", delete=False,
+        )
+        doc.save(tmp.name)
+        doc.close()
+
+        client, raw = _mock_openai_raw_client(DUMMY_SCHEMA_JSON)
+        try:
+            with patch(
+                "petey.extract._make_client",
+                return_value=client,
+            ):
+                asyncio.run(
+                    infer_schema_vision_async(
+                        tmp.name, api_key="k",
+                        header_pages=1, max_pages=2,
+                    )
+                )
+        finally:
+            os.unlink(tmp.name)
+
+        call_kwargs = raw.chat.completions.create.call_args.kwargs
+        parts = call_kwargs["messages"][1]["content"]
+        text_parts = [
+            p["text"] for p in parts if p.get("type") == "text"
+        ]
+        # Should mention "header page" somewhere
+        header_labels = [
+            t for t in text_parts if "header" in t.lower()
+        ]
+        assert len(header_labels) >= 1
+
+    def test_max_pages_limits_content(self):
+        """max_pages=1 with a 3-page PDF should send 1 content
+        image (plus header if any)."""
+        from petey.extract import infer_schema_vision_async
+        import tempfile
+        import fitz
+
+        doc = fitz.open()
+        for i in range(3):
+            page = doc.new_page()
+            page.insert_text((72, 72), f"Page {i+1}")
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".pdf", delete=False,
+        )
+        doc.save(tmp.name)
+        doc.close()
+
+        client, raw = _mock_openai_raw_client(DUMMY_SCHEMA_JSON)
+        try:
+            with patch(
+                "petey.extract._make_client",
+                return_value=client,
+            ):
+                asyncio.run(
+                    infer_schema_vision_async(
+                        tmp.name, api_key="k",
+                        max_pages=1,
+                    )
+                )
+        finally:
+            os.unlink(tmp.name)
+
+        call_kwargs = raw.chat.completions.create.call_args.kwargs
+        parts = call_kwargs["messages"][1]["content"]
+        image_parts = [
+            p for p in parts if p.get("type") == "image_url"
+        ]
+        assert len(image_parts) == 1

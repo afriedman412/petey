@@ -891,9 +891,12 @@ async def infer_schema_async(
         Schema spec dict with name, record_type, fields, etc.
     """
     import json as _json
+    import fitz as _fitz
 
-    all_pages = extract_text_pages(pdf_path, parser)
-    total = len(all_pages)
+    # Determine which pages we actually need before parsing
+    _doc = _fitz.open(pdf_path)
+    total = len(_doc)
+    _doc.close()
 
     if page_range:
         indices = _parse_page_range(page_range, total)
@@ -903,17 +906,36 @@ async def infer_schema_async(
     header_indices = indices[:header_pages]
     content_indices = indices[header_pages:]
 
+    # Only parse the pages we need (header + up to max_pages content)
+    needed = set(header_indices) | set(content_indices[:max_pages])
+    needed_sorted = sorted(needed)
+
+    if needed_sorted:
+        subset_path = _subset_pdf(pdf_path, needed_sorted)
+        try:
+            parsed = extract_text_pages(subset_path, parser)
+        finally:
+            import os as _os
+            _os.unlink(subset_path)
+        # Map subset index back to original page index
+        page_map = {
+            orig: parsed[i]
+            for i, orig in enumerate(needed_sorted)
+        }
+    else:
+        page_map = {}
+
     header_text = ""
     if header_indices:
         header_text = (
             "\n\n---PAGE BREAK---\n\n".join(
-                all_pages[i] for i in header_indices
+                page_map[i] for i in header_indices
             )
             + "\n\n---HEADER END---\n\n"
         )
 
     sample_pages = [
-        all_pages[i] for i in content_indices[:max_pages]
+        page_map[i] for i in content_indices[:max_pages]
     ]
     sample = header_text + "\n\n---PAGE BREAK---\n\n".join(
         sample_pages
@@ -951,13 +973,167 @@ async def infer_schema_async(
         )
         content = resp.choices[0].message.content
 
+    if not content or not content.strip():
+        raise ValueError(
+            f"Model '{model}' returned empty response."
+        )
+
     # Parse JSON (handle markdown code blocks)
     text = content.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
+    if "```" in text:
+        text = text.split("```", 1)[1]
+        if text.startswith("json"):
+            text = text[4:]
         text = text.rsplit("```", 1)[0]
+    text = text.strip()
 
-    return _json.loads(text)
+    try:
+        return _json.loads(text)
+    except _json.JSONDecodeError:
+        raise ValueError(
+            f"Model returned invalid JSON. Response: "
+            f"{text[:200]}..."
+        )
+
+
+async def infer_schema_vision_async(
+    pdf_path: str,
+    *,
+    model: str = "gpt-4.1-mini",
+    api_key: str | None = None,
+    llm_backend: str | None = None,
+    max_pages: int = 2,
+    page_range: str | None = None,
+    header_pages: int = 0,
+) -> dict:
+    """Analyze a PDF and suggest a schema using vision (images).
+
+    Renders PDF pages as images and sends them directly to the
+    LLM, bypassing text parsing entirely.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        model: LLM model ID (must support vision).
+        api_key: Optional API key override.
+        llm_backend: LLM backend override.
+        max_pages: Number of content pages to sample (default 2).
+        page_range: Optional page range string (e.g. "5-10").
+        header_pages: Number of leading pages within the range
+            to treat as headers.
+
+    Returns:
+        Schema spec dict with name, record_type, fields, etc.
+    """
+    import json as _json
+    import base64 as _b64
+    import fitz as _fitz
+
+    doc = _fitz.open(pdf_path)
+    total = len(doc)
+
+    if page_range:
+        indices = _parse_page_range(page_range, total)
+    else:
+        indices = list(range(total))
+
+    header_indices = indices[:header_pages]
+    content_indices = indices[header_pages:]
+    needed = list(header_indices) + list(
+        content_indices[:max_pages]
+    )
+
+    # Render pages to PNG base64
+    images = []
+    for idx in needed:
+        page = doc[idx]
+        pix = page.get_pixmap(dpi=150)
+        img_bytes = pix.tobytes("png")
+        b64 = _b64.b64encode(img_bytes).decode()
+        is_header = idx in header_indices
+        images.append((idx, b64, is_header))
+    doc.close()
+
+    client = _make_client(model, api_key, llm_backend)
+    raw = getattr(client, "client", client)
+
+    prompt_text = "Analyze this document and suggest a schema."
+    if header_indices:
+        prompt_text += (
+            " The first image(s) are header pages that "
+            "provide context (column names, metadata)."
+        )
+
+    if hasattr(raw, "messages"):
+        # Anthropic — images as content blocks
+        content_blocks = [{"type": "text", "text": prompt_text}]
+        for idx, b64, is_header in images:
+            label = f"header page {idx+1}" if is_header else f"page {idx+1}"
+            content_blocks.append({
+                "type": "text", "text": f"[{label}]",
+            })
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": b64,
+                },
+            })
+        resp = await raw.messages.create(
+            model=model,
+            system=INFER_SCHEMA_SYSTEM,
+            messages=[{"role": "user", "content": content_blocks}],
+            temperature=0,
+            max_tokens=4096,
+        )
+        content = resp.content[0].text
+    else:
+        # OpenAI — images as content parts
+        content_parts = [{"type": "text", "text": prompt_text}]
+        for idx, b64, is_header in images:
+            label = f"header page {idx+1}" if is_header else f"page {idx+1}"
+            content_parts.append({
+                "type": "text", "text": f"[{label}]",
+            })
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{b64}",
+                },
+            })
+        resp = await raw.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": INFER_SCHEMA_SYSTEM},
+                {"role": "user", "content": content_parts},
+            ],
+            temperature=0,
+            max_tokens=4096,
+        )
+        content = resp.choices[0].message.content
+
+    if not content or not content.strip():
+        raise ValueError(
+            f"Model '{model}' returned empty response. "
+            "It may not support vision or the input was "
+            "too large. Try a different model."
+        )
+
+    text = content.strip()
+    if "```" in text:
+        text = text.split("```", 1)[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.rsplit("```", 1)[0]
+    text = text.strip()
+
+    try:
+        return _json.loads(text)
+    except _json.JSONDecodeError:
+        raise ValueError(
+            f"Model returned invalid JSON. Response: "
+            f"{text[:200]}..."
+        )
 
 
 def infer_schema(
