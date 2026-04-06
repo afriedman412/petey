@@ -6,7 +6,7 @@ Petey is a framework for PDF data extraction. It wires the PDF parser of your ch
 pip install petey
 ```
 
-For demos, tutorials, and benchmarks, visit [the Petey blog](https://medium.com/@af412).
+For the web version, demos and tutorials, visit [Petey](https://petey.cc/demos).
 
 ## Why Petey?
 
