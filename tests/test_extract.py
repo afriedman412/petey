@@ -359,6 +359,40 @@ class TestProviderDetection:
         assert client is not None
 
 
+class TestModelKwargs:
+    def test_gpt4_returns_max_tokens_and_temperature(self):
+        from petey.extract import _model_kwargs
+        kw = _model_kwargs("gpt-4.1-mini")
+        assert kw == {"max_tokens": 4096, "temperature": 0}
+
+    def test_gpt4_custom_max_tokens(self):
+        from petey.extract import _model_kwargs
+        kw = _model_kwargs("gpt-4.1", max_tokens=8192)
+        assert kw == {"max_tokens": 8192, "temperature": 0}
+
+    def test_gpt5_returns_max_completion_tokens(self):
+        from petey.extract import _model_kwargs
+        kw = _model_kwargs("gpt-5-mini")
+        assert kw == {"max_completion_tokens": 4096}
+        assert "temperature" not in kw
+
+    def test_gpt5_full(self):
+        from petey.extract import _model_kwargs
+        kw = _model_kwargs("gpt-5")
+        assert "max_completion_tokens" in kw
+        assert "max_tokens" not in kw
+
+    def test_gpt54(self):
+        from petey.extract import _model_kwargs
+        kw = _model_kwargs("gpt-5.4-mini")
+        assert kw == {"max_completion_tokens": 4096}
+
+    def test_non_gpt_model(self):
+        from petey.extract import _model_kwargs
+        kw = _model_kwargs("claude-sonnet-4-6")
+        assert kw == {"max_tokens": 4096, "temperature": 0}
+
+
 class TestMakeMessages:
     def test_basic_messages(self):
         from petey.extract import _make_messages
