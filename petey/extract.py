@@ -536,6 +536,18 @@ def extract_text_pages(
 
 # --- LLM client ---
 
+
+def _model_kwargs(model: str, max_tokens: int = 4096) -> dict:
+    """Return model-specific API kwargs.
+
+    GPT-5+ models require 'max_completion_tokens' instead of 'max_tokens'
+    and do not support temperature=0.
+    """
+    if model.startswith("gpt-5"):
+        return {"max_completion_tokens": max_tokens}
+    return {"max_tokens": max_tokens, "temperature": 0}
+
+
 def _get_provider(model: str, llm_backend: str | None = None) -> str:
     """Determine which LLM provider to use.
 
@@ -772,8 +784,7 @@ async def extract_async(
                     messages=_make_messages(
                         text, instructions,
                     ),
-                    temperature=0,
-                    max_tokens=4096,
+                    **_model_kwargs(model),
                 )
                 data = result.model_dump(by_alias=True)
                 for msg in _check_extraction_quality(
@@ -968,8 +979,7 @@ async def infer_schema_async(
                 {"role": "system", "content": INFER_SCHEMA_SYSTEM},
                 {"role": "user", "content": user_msg},
             ],
-            temperature=0,
-            max_tokens=4096,
+            **_model_kwargs(model),
         )
         content = resp.choices[0].message.content
 
@@ -1107,8 +1117,7 @@ async def infer_schema_vision_async(
                 {"role": "system", "content": INFER_SCHEMA_SYSTEM},
                 {"role": "user", "content": content_parts},
             ],
-            temperature=0,
-            max_tokens=4096,
+            **_model_kwargs(model),
         )
         content = resp.choices[0].message.content
 
@@ -1387,7 +1396,7 @@ async def extract_pages_async(
                             messages=_make_messages(
                                 text, instructions,
                             ),
-                            temperature=0,
+                            **_model_kwargs(model),
                         )
                     )
                     data = result.model_dump(by_alias=True)
@@ -1531,7 +1540,7 @@ async def extract_batch(
                         messages=_make_messages(
                             text, instructions,
                         ),
-                        temperature=0,
+                        **_model_kwargs(model),
                     )
                 )
             data = result.model_dump(by_alias=True)

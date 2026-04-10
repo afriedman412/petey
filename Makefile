@@ -1,14 +1,15 @@
 VENV = venv
+SYSTEM_PYTHON ?= /Library/Frameworks/Python.framework/Versions/3.13/bin/python3
 PYTHON = $(VENV)/bin/python
 PIP = $(VENV)/bin/pip
 
 .PHONY: venv install test clean publish release minor
 
 venv:
-	python3 -m venv $(VENV)
+	arch -arm64 $(SYSTEM_PYTHON) -m venv $(VENV)
 
 install: venv
-	$(PIP) install -e ".[dev]"
+	arch -arm64 $(PIP) install -e ".[dev]"
 
 test: install
 	$(PYTHON) -m pytest tests/ -v
