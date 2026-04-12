@@ -1,6 +1,6 @@
 """Petey — The Easy PDF Extractor."""
 
-from petey.schema import build_model, load_schema
+from petey.schema import build_model, load_schema, normalize_dates
 from petey.extract import (
     extract,
     extract_async,
@@ -16,6 +16,7 @@ from petey.extract import (
 __all__ = [
     "build_model",
     "load_schema",
+    "normalize_dates",
     "extract",
     "extract_async",
     "extract_batch",
