@@ -120,3 +120,35 @@ def load_schema(schema_path: str | Path) -> tuple[type[BaseModel], dict]:
     with open(schema_path) as f:
         spec = yaml.safe_load(f)
     return build_model(spec), spec
+
+
+def _date_fields(spec: dict) -> set[str]:
+    """Return the set of field names with type 'date' in *spec*."""
+    names: set[str] = set()
+    for name, cfg in spec.get("fields", {}).items():
+        if cfg.get("type") == "date":
+            names.add(_safe_field_name(name))
+    return names
+
+
+def normalize_dates(record: dict, spec: dict) -> dict:
+    """Normalize date fields in *record* to YYYY-MM-DD format.
+
+    Uses ``dateutil.parser`` to handle formats like
+    "December 8, 1986", "1986-12-08", "DEC 30 1993", etc.
+    Values that cannot be parsed are left unchanged.
+    """
+    from dateutil import parser as _dp
+
+    fields = _date_fields(spec)
+    if not fields:
+        return record
+    for key in fields:
+        val = record.get(key)
+        if not val or not isinstance(val, str):
+            continue
+        try:
+            record[key] = _dp.parse(val).strftime("%Y-%m-%d")
+        except (ValueError, OverflowError):
+            pass  # leave unparseable values as-is
+    return record

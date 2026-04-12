@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 import yaml
 
-from petey.schema import load_schema
+from petey.schema import load_schema, normalize_dates
 from petey.extract import (
     extract_batch, extract_pages_async, infer_schema,
     PARSERS, LLM_BACKENDS,
@@ -383,6 +383,10 @@ def run_extract(args):
                 all_records.append(item)
         elif not data.get("_error"):
             all_records.append(data)
+
+    # Normalize date fields to YYYY-MM-DD
+    for rec in all_records:
+        normalize_dates(rec, spec)
 
     if fmt == "csv":
         flat, keys = _flatten(all_records)

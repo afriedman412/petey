@@ -33,6 +33,7 @@ dependencies = [
     "Pillow",
     "litellm",
     "httpx",
+    "python-dateutil",
 ]
 
 [project.urls]
