@@ -41,6 +41,7 @@ async def extract_pages(pdf_path: str) -> list[str]:
                 content=pdf_bytes,
                 file_name=os.path.basename(pdf_path),
             ),
+            split_pdf_allow_failed=True,
         ),
     )
 

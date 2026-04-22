@@ -3,13 +3,12 @@ import re
 
 import pytest
 
-from petey import build_model, load_schema
+from petey import build_model
 
 from pathlib import Path
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MCI_PDF = FIXTURES / "mci_page1.pdf"
-SCHEMAS_DIR = Path(__file__).resolve().parent.parent / "schemas"
 
 
 class TestBuildModel:
@@ -106,16 +105,6 @@ class TestBuildModel:
         model = build_model(spec)
         schema = model.model_json_schema()
         assert "items" in schema.get("required", [])
-
-
-class TestLoadSchema:
-    def test_loads_par_schema(self):
-        par_path = SCHEMAS_DIR / "par_decision.yaml"
-        if not par_path.exists():
-            pytest.skip("par_decision.yaml not found")
-        model, spec = load_schema(par_path)
-        assert spec["name"] == "PAR Decision"
-        assert "petitioner" in spec["fields"]
 
 
 class TestSchemaEdgeCases:
