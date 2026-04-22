@@ -27,7 +27,7 @@ import fitz
 import pymupdf4llm
 import instructor
 from pydantic import BaseModel
-from openai import AsyncOpenAI
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 from anthropic import AsyncAnthropic
 
 SYSTEM = (
@@ -537,50 +537,175 @@ def extract_text_pages(
 # --- LLM client ---
 
 
-def _model_kwargs(model: str, max_tokens: int = 4096) -> dict:
+# --- Model registry ---
+#
+# Explicit registration of known models. Each entry is a dict with:
+#
+#   provider (required)
+#       Name of the LLM backend. Must be a key in ``LLM_BACKENDS``.
+#       Built-ins: "openai", "azure_openai", "anthropic", "litellm".
+#
+#   config (optional)
+#       Dict of kwargs passed to the backend *builder* (not the
+#       completion call). Lets each model carry its own endpoint,
+#       API version, organisation, and API-key env var — so multiple
+#       deployments of the same backend can coexist in one process
+#       without mutating os.environ.
+#
+#   kwargs (optional)
+#       Dict of kwargs passed to every ``chat.completions.create()``
+#       call. Overrides the default ``{"max_tokens": 4096,
+#       "temperature": 0}``. Use this for reasoning models that need
+#       ``max_completion_tokens`` and reject ``temperature``.
+#
+# Example — one process, two Azure tenants:
+#
+#   MODELS["tenant-a-gpt-4o"] = {
+#       "provider": "azure_openai",
+#       "config": {
+#           "api_version": "2024-06-01",
+#           "azure_endpoint": "https://tenant-a.openai.azure.com",
+#           "api_key_env": "TENANT_A_API_KEY",
+#       },
+#   }
+#   MODELS["tenant-b-gpt-5"] = {
+#       "provider": "azure_openai",
+#       "config": {
+#           "api_version": "2024-10-21",
+#           "azure_endpoint": "https://tenant-b.openai.azure.com",
+#           "api_key_env": "TENANT_B_API_KEY",
+#       },
+#       "kwargs": {"max_completion_tokens": 4096},
+#   }
+
+_DEFAULT_MODEL_KWARGS = {"max_tokens": 4096, "temperature": 0}
+_REASONING_MODEL_KWARGS = {"max_completion_tokens": 4096}
+
+MODELS: dict[str, dict] = {
+    # OpenAI
+    "gpt-4.1":      {"provider": "openai"},
+    "gpt-4.1-mini": {"provider": "openai"},
+    "gpt-4o":       {"provider": "openai"},
+    "gpt-4o-mini":  {"provider": "openai"},
+    "gpt-5":        {"provider": "openai", "kwargs": _REASONING_MODEL_KWARGS},
+    "gpt-5-mini":   {"provider": "openai", "kwargs": _REASONING_MODEL_KWARGS},
+    # Anthropic
+    "claude-opus-4-7":           {"provider": "anthropic"},
+    "claude-sonnet-4-6":         {"provider": "anthropic"},
+    "claude-haiku-4-5-20251001": {"provider": "anthropic"},
+}
+
+
+_LITELLM_PREFIXES = (
+    "gemini/", "mistral/", "ollama/", "ollama_chat/",
+    "bedrock/", "vertex_ai/", "cohere/", "replicate/",
+    "huggingface/", "together_ai/", "openrouter/",
+    "fireworks_ai/", "deepseek/",
+)
+
+
+def _infer_provider(model: str) -> str | None:
+    """Prefix-based provider inference. Returns None if unrecognised."""
+    if model.startswith("claude"):
+        return "anthropic"
+    if any(model.startswith(p) for p in _LITELLM_PREFIXES):
+        return "litellm"
+    if (
+        model.startswith("gpt-")
+        or model.startswith("o1")
+        or model.startswith("o3")
+        or model.startswith("o4")
+    ):
+        return "openai"
+    return None
+
+
+def _infer_model_kwargs(model: str) -> dict:
+    """Prefix-based model-kwargs inference for unregistered models."""
+    if (
+        model.startswith("gpt-5")
+        or model.startswith("o1")
+        or model.startswith("o3")
+        or model.startswith("o4")
+    ):
+        return dict(_REASONING_MODEL_KWARGS)
+    return dict(_DEFAULT_MODEL_KWARGS)
+
+
+def _model_kwargs(model: str) -> dict:
     """Return model-specific API kwargs.
 
-    GPT-5+ models require 'max_completion_tokens' instead of 'max_tokens'
-    and do not support temperature=0.
+    Consults ``MODELS`` registry first; falls back to prefix inference
+    for unregistered models.
     """
-    if model.startswith("gpt-5"):
-        return {"max_completion_tokens": max_tokens}
-    return {"max_tokens": max_tokens, "temperature": 0}
+    entry = MODELS.get(model)
+    if entry is not None:
+        return dict(entry.get("kwargs", _DEFAULT_MODEL_KWARGS))
+    return _infer_model_kwargs(model)
+
+
+def _resolve_api_model(model: str) -> str:
+    """Resolve a registry key to the identifier the API expects.
+
+    Returns the registry entry's ``model`` field if set, otherwise
+    returns the key unchanged. This lets a registry entry serve as
+    an alias (e.g. ``tenant-a-gpt-4o`` → Azure deployment
+    ``gpt-4o``), so multiple backends exposing the same underlying
+    model can coexist under distinct petey-side names.
+    """
+    entry = MODELS.get(model)
+    if entry is not None and "model" in entry:
+        return entry["model"]
+    return model
 
 
 def _get_provider(model: str, llm_backend: str | None = None) -> str:
-    """Determine which LLM provider to use.
+    """Determine which LLM provider to use for ``model``.
+
+    Resolution order:
+        1. Explicit ``llm_backend`` kwarg (highest priority).
+        2. ``MODELS`` registry entry for the model.
+        3. Prefix-based inference (emits a warning — register the
+           model to silence it).
+        4. Error — the model is unrecognised.
 
     Args:
-        model: Model ID string (e.g. "gpt-4.1-mini", "claude-sonnet-4-6").
-        llm_backend: Explicit override. One of:
-            "openai"    — direct OpenAI client
-            "anthropic" — direct Anthropic client
-            "litellm"   — unified router (gemini/, mistral/, ollama/, etc.)
-            None        — auto-detect from model string (default)
+        model: Model ID string.
+        llm_backend: Optional explicit provider override. Must be a
+            key in ``LLM_BACKENDS``.
 
     Returns:
-        Provider string: "openai", "anthropic", or "litellm".
+        Provider name.
     """
     if llm_backend is not None:
         return llm_backend
-    if model.startswith("claude"):
-        return "anthropic"
-    # Models that need litellm routing
-    litellm_prefixes = (
-        "gemini/", "mistral/", "ollama/", "ollama_chat/",
-        "bedrock/", "vertex_ai/", "cohere/", "replicate/",
-        "huggingface/", "together_ai/", "openrouter/",
-        "fireworks_ai/", "deepseek/",
+    entry = MODELS.get(model)
+    if entry is not None:
+        return entry["provider"]
+    inferred = _infer_provider(model)
+    if inferred is None:
+        raise ValueError(
+            f"Unknown model '{model}'. Register it in "
+            f"petey.extract.MODELS with "
+            f"{{'provider': '<name>', ...}}, or pass "
+            f"llm_backend='<name>' explicitly. "
+            f"Known models: {', '.join(sorted(MODELS))}"
+        )
+    warnings.warn(
+        f"Model '{model}' is not in the MODELS registry; inferred "
+        f"provider='{inferred}' from prefix. Register it in "
+        f"petey.extract.MODELS to silence this warning.",
+        stacklevel=2,
     )
-    if any(model.startswith(p) for p in litellm_prefixes):
-        return "litellm"
-    return "openai"
+    return inferred
 
 
 def _make_client_openai(api_key: str | None = None, **kwargs):
-    """Build an instructor-wrapped OpenAI async client."""
-    base_url = kwargs.get("base_url")
+    """Build an instructor-wrapped OpenAI async client.
+
+    Also handles any OpenAI-compatible endpoint (vLLM, Ollama,
+    Together, etc.) via the ``base_url`` kwarg.
+    """
     env_var = kwargs.get("api_key_env", "OPENAI_API_KEY")
     key = api_key or os.environ.get(env_var)
     if not key:
@@ -588,10 +713,73 @@ def _make_client_openai(api_key: str | None = None, **kwargs):
             f"Missing API key for OpenAI (llm). "
             f"Set {env_var} in your .env file or environment."
         )
+    organization = (
+        kwargs.get("organization")
+        or os.environ.get("OPENAI_ORGANIZATION")
+    )
     client_kwargs = {"api_key": key}
+    base_url = kwargs.get("base_url")
     if base_url:
         client_kwargs["base_url"] = base_url
+    if organization:
+        client_kwargs["organization"] = organization
     return instructor.from_openai(AsyncOpenAI(**client_kwargs))
+
+
+def _make_client_azure_openai(api_key: str | None = None, **kwargs):
+    """Build an instructor-wrapped Azure OpenAI async client.
+
+    Required configuration (kwarg or env var):
+        api_key        — OPENAI_API_KEY (or ``api_key_env`` override)
+        api_version    — API_VERSION / OPENAI_API_VERSION
+        azure_endpoint — OPENAI_API_BASE / AZURE_OPENAI_ENDPOINT
+
+    Optional:
+        organization   — OPENAI_ORGANIZATION
+    """
+    env_var = kwargs.get("api_key_env", "OPENAI_API_KEY")
+    key = api_key or os.environ.get(env_var)
+    if not key:
+        raise ValueError(
+            f"Missing API key for Azure OpenAI (llm). "
+            f"Set {env_var} in your .env file or environment."
+        )
+    api_version = (
+        kwargs.get("api_version")
+        or os.environ.get("API_VERSION")
+        or os.environ.get("OPENAI_API_VERSION")
+    )
+    if not api_version:
+        raise ValueError(
+            "Azure OpenAI requires api_version. Set API_VERSION "
+            "or OPENAI_API_VERSION, or pass api_version to the "
+            "backend config."
+        )
+    azure_endpoint = (
+        kwargs.get("azure_endpoint")
+        or os.environ.get("OPENAI_API_BASE")
+        or os.environ.get("AZURE_OPENAI_ENDPOINT")
+    )
+    if not azure_endpoint:
+        raise ValueError(
+            "Azure OpenAI requires an endpoint. Set "
+            "OPENAI_API_BASE or AZURE_OPENAI_ENDPOINT, or pass "
+            "azure_endpoint to the backend config."
+        )
+    organization = (
+        kwargs.get("organization")
+        or os.environ.get("OPENAI_ORGANIZATION")
+    )
+    client_kwargs = {
+        "api_key": key,
+        "api_version": api_version,
+        "azure_endpoint": azure_endpoint,
+    }
+    if organization:
+        client_kwargs["organization"] = organization
+    return instructor.from_openai(
+        AsyncAzureOpenAI(**client_kwargs),
+    )
 
 
 def _make_client_anthropic(api_key: str | None = None, **kwargs):
@@ -634,6 +822,7 @@ def _make_client_litellm(api_key: str | None = None, **kwargs):
 
 _LLM_CLIENT_BUILDERS = {
     "openai": _make_client_openai,
+    "azure_openai": _make_client_azure_openai,
     "anthropic": _make_client_anthropic,
     "litellm": _make_client_litellm,
 }
@@ -659,13 +848,48 @@ def _make_api_llm_client(api_key: str | None = None, **cfg):
     return builder(api_key, **cfg)
 
 
-LLM_BACKENDS = {
-    **_LLM_CLIENT_BUILDERS,
-    **{name: _make_plugin_loader(path)
-       for name, path in PLUGIN_LLM_BACKENDS.items()},
-    **{name: partial(_make_api_llm_client, **cfg)
-       for name, cfg in API_LLM_BACKENDS.items()},
-}
+class _LLMBackendsView:
+    """Dict-like live view over the LLM backend registries.
+
+    Resolves ``_LLM_CLIENT_BUILDERS`` (built-ins),
+    ``PLUGIN_LLM_BACKENDS``, and ``API_LLM_BACKENDS`` on every access,
+    so runtime mutations (e.g. adding a new tenant via
+    ``API_LLM_BACKENDS["foo"] = {...}``) take effect immediately
+    without needing to re-import.
+    """
+
+    def _snapshot(self) -> dict:
+        return {
+            **_LLM_CLIENT_BUILDERS,
+            **{n: _make_plugin_loader(p)
+               for n, p in PLUGIN_LLM_BACKENDS.items()},
+            **{n: partial(_make_api_llm_client, **cfg)
+               for n, cfg in API_LLM_BACKENDS.items()},
+        }
+
+    def __contains__(self, key):
+        return key in self._snapshot()
+
+    def __iter__(self):
+        return iter(self._snapshot())
+
+    def __len__(self):
+        return len(self._snapshot())
+
+    def get(self, key, default=None):
+        return self._snapshot().get(key, default)
+
+    def keys(self):
+        return self._snapshot().keys()
+
+    def items(self):
+        return self._snapshot().items()
+
+    def values(self):
+        return self._snapshot().values()
+
+
+LLM_BACKENDS = _LLMBackendsView()
 
 
 def _make_client(
@@ -676,13 +900,13 @@ def _make_client(
     """Build an instructor-wrapped async client for the given model.
 
     Args:
-        model: Model ID string. Determines provider auto-detection.
+        model: Model ID string. If the model is registered in
+            ``MODELS``, its ``config`` dict is passed to the backend
+            builder (lets e.g. multiple Azure deployments coexist).
         api_key: Optional API key override.
-        llm_backend: Override auto-detection.
-            "openai"    — direct OpenAI client
-            "anthropic" — direct Anthropic client
-            "litellm"   — unified router (supports 100+ providers)
-            None        — auto-detect from model string (default)
+        llm_backend: Optional provider override. Must be a key in
+            ``LLM_BACKENDS``. If None, resolved via the ``MODELS``
+            registry or prefix inference.
 
     Returns:
         An instructor-wrapped async client ready for
@@ -695,7 +919,9 @@ def _make_client(
             f"LLM backend '{provider}' not found. "
             f"Available backends: {', '.join(LLM_BACKENDS)}"
         )
-    return fn(api_key)
+    entry = MODELS.get(model, {})
+    config = entry.get("config", {})
+    return fn(api_key, **config)
 
 
 def _make_messages(text: str, instructions: str = "") -> list[dict]:
@@ -773,12 +999,13 @@ async def extract_async(
             stacklevel=2,
         )
     client = _make_client(model, api_key, llm_backend)
+    api_model = _resolve_api_model(model)
     label = os.path.basename(pdf_path)
     for attempt in range(5):
         try:
             async with mgr.api():
                 result = await client.chat.completions.create(
-                    model=model,
+                    model=api_model,
                     response_model=response_model,
                     max_retries=2,
                     messages=_make_messages(
@@ -953,6 +1180,7 @@ async def infer_schema_async(
     )
 
     client = _make_client(model, api_key, llm_backend)
+    api_model = _resolve_api_model(model)
 
     # Use raw (unwrapped) client to get plain text back
     raw = getattr(client, "client", client)
@@ -964,7 +1192,7 @@ async def infer_schema_async(
     if hasattr(raw, "messages"):
         # Anthropic client
         resp = await raw.messages.create(
-            model=model,
+            model=api_model,
             system=INFER_SCHEMA_SYSTEM,
             messages=[{"role": "user", "content": user_msg}],
             temperature=0,
@@ -974,7 +1202,7 @@ async def infer_schema_async(
     else:
         # OpenAI-compatible client
         resp = await raw.chat.completions.create(
-            model=model,
+            model=api_model,
             messages=[
                 {"role": "system", "content": INFER_SCHEMA_SYSTEM},
                 {"role": "user", "content": user_msg},
@@ -1064,6 +1292,7 @@ async def infer_schema_vision_async(
     doc.close()
 
     client = _make_client(model, api_key, llm_backend)
+    api_model = _resolve_api_model(model)
     raw = getattr(client, "client", client)
 
     prompt_text = "Analyze this document and suggest a schema."
@@ -1090,7 +1319,7 @@ async def infer_schema_vision_async(
                 },
             })
         resp = await raw.messages.create(
-            model=model,
+            model=api_model,
             system=INFER_SCHEMA_SYSTEM,
             messages=[{"role": "user", "content": content_blocks}],
             temperature=0,
@@ -1112,7 +1341,7 @@ async def infer_schema_vision_async(
                 },
             })
         resp = await raw.chat.completions.create(
-            model=model,
+            model=api_model,
             messages=[
                 {"role": "system", "content": INFER_SCHEMA_SYSTEM},
                 {"role": "user", "content": content_parts},
@@ -1337,6 +1566,7 @@ async def extract_pages_async(
         flush=True,
     )
     client = _make_client(model, api_key, llm_backend)
+    api_model = _resolve_api_model(model)
     results = [None] * len(chunk_groups)
     if not chunk_groups:
         print(
@@ -1390,7 +1620,7 @@ async def extract_pages_async(
                 try:
                     result = (
                         await client.chat.completions.create(
-                            model=model,
+                            model=api_model,
                             response_model=response_model,
                             max_retries=2,
                             messages=_make_messages(
@@ -1507,6 +1737,7 @@ async def extract_batch(
     mgr = get_manager()
     mgr.configure(api_limit=concurrency)
     client = _make_client(model, api_key, llm_backend)
+    api_model = _resolve_api_model(model)
     results = []
 
     parser_fn = PARSERS.get(parser)
@@ -1534,7 +1765,7 @@ async def extract_batch(
             async with mgr.api():
                 result = (
                     await client.chat.completions.create(
-                        model=model,
+                        model=api_model,
                         response_model=response_model,
                         max_retries=2,
                         messages=_make_messages(

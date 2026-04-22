@@ -96,6 +96,117 @@ class TestLLMBackendConfig:
         with pytest.raises(ValueError, match="Unknown LLM client"):
             _make_api_llm_client(client="buttllm")
 
+    def test_api_llm_backends_are_live(self):
+        """Mutating API_LLM_BACKENDS at runtime should be visible
+        to LLM_BACKENDS lookups (no module reload required)."""
+        from petey.extract import API_LLM_BACKENDS, LLM_BACKENDS
+        assert "ephemeral-test-backend" not in LLM_BACKENDS
+        try:
+            API_LLM_BACKENDS["ephemeral-test-backend"] = {
+                "client": "openai",
+                "api_key_env": "NONEXISTENT_KEY",
+            }
+            assert "ephemeral-test-backend" in LLM_BACKENDS
+            assert LLM_BACKENDS.get(
+                "ephemeral-test-backend",
+            ) is not None
+        finally:
+            del API_LLM_BACKENDS["ephemeral-test-backend"]
+        assert "ephemeral-test-backend" not in LLM_BACKENDS
+
+
+class TestModelsRegistryConfig:
+    """Models with a ``config`` dict should pass it to the builder."""
+
+    def test_config_from_model_entry_reaches_builder(self):
+        from petey.extract import MODELS, _make_client
+        MODELS["_t_azure"] = {
+            "provider": "azure_openai",
+            "config": {
+                "api_version": "2024-06-01",
+                "azure_endpoint": "https://example.azure.test",
+                "api_key_env": "T_AZURE_KEY",
+            },
+        }
+        try:
+            with patch.dict(os.environ, {"T_AZURE_KEY": "secret"}):
+                with patch(
+                    "petey.extract.AsyncAzureOpenAI",
+                ) as mock_az:
+                    with patch(
+                        "petey.extract.instructor",
+                    ) as mock_inst:
+                        mock_inst.from_openai.return_value = "cli"
+                        _make_client("_t_azure")
+            mock_az.assert_called_once_with(
+                api_key="secret",
+                api_version="2024-06-01",
+                azure_endpoint="https://example.azure.test",
+            )
+        finally:
+            del MODELS["_t_azure"]
+
+    def test_api_model_alias(self):
+        """``model`` field in MODELS entry should override the key
+        as the identifier sent to the API."""
+        from petey.extract import MODELS, _resolve_api_model
+        MODELS["_alias_test"] = {
+            "provider": "azure_openai",
+            "model": "actual-deployment-name",
+            "config": {},
+        }
+        try:
+            assert _resolve_api_model(
+                "_alias_test",
+            ) == "actual-deployment-name"
+            assert _resolve_api_model(
+                "unregistered-model",
+            ) == "unregistered-model"
+            assert _resolve_api_model("gpt-4.1-mini") == "gpt-4.1-mini"
+        finally:
+            del MODELS["_alias_test"]
+
+    def test_two_tenants_same_provider_coexist(self):
+        """Same provider (azure_openai), two different deployments,
+        no env mutation between calls."""
+        from petey.extract import MODELS, _make_client
+        MODELS["_t_a"] = {
+            "provider": "azure_openai",
+            "config": {
+                "api_version": "2024-06-01",
+                "azure_endpoint": "https://a.azure.test",
+                "api_key_env": "T_A_KEY",
+            },
+        }
+        MODELS["_t_b"] = {
+            "provider": "azure_openai",
+            "config": {
+                "api_version": "2024-10-21",
+                "azure_endpoint": "https://b.azure.test",
+                "api_key_env": "T_B_KEY",
+            },
+        }
+        try:
+            env = {"T_A_KEY": "ka", "T_B_KEY": "kb"}
+            with patch.dict(os.environ, env):
+                with patch(
+                    "petey.extract.AsyncAzureOpenAI",
+                ) as mock_az:
+                    with patch(
+                        "petey.extract.instructor",
+                    ) as mock_inst:
+                        mock_inst.from_openai.return_value = "cli"
+                        _make_client("_t_a")
+                        _make_client("_t_b")
+            calls = mock_az.call_args_list
+            assert calls[0].kwargs["api_key"] == "ka"
+            assert calls[0].kwargs["azure_endpoint"] == "https://a.azure.test"
+            assert calls[1].kwargs["api_key"] == "kb"
+            assert calls[1].kwargs["azure_endpoint"] == "https://b.azure.test"
+        finally:
+            del MODELS["_t_a"]
+            del MODELS["_t_b"]
+
 
 class TestPluginRegistries:
     """Test the PLUGIN_* registries and lazy loader."""
@@ -170,9 +281,22 @@ class TestProviderDetection:
         from petey.extract import _get_provider
         assert _get_provider("claude-sonnet-4-6") == "anthropic"
 
-    def test_openai_default(self):
+    def test_unknown_model_raises(self):
         from petey.extract import _get_provider
-        assert _get_provider("some-other-model") == "openai"
+        with pytest.raises(ValueError, match="Unknown model"):
+            _get_provider("some-other-model")
+
+    def test_unknown_model_with_explicit_backend(self):
+        from petey.extract import _get_provider
+        assert _get_provider(
+            "some-other-model", llm_backend="openai",
+        ) == "openai"
+
+    def test_azure_openai_requires_explicit_routing(self):
+        from petey.extract import _get_provider
+        assert _get_provider(
+            "my-azure-deployment", llm_backend="azure_openai",
+        ) == "azure_openai"
 
     def test_litellm_gemini(self):
         from petey.extract import _get_provider
@@ -202,11 +326,6 @@ class TestModelKwargs:
         from petey.extract import _model_kwargs
         kw = _model_kwargs("gpt-4.1-mini")
         assert kw == {"max_tokens": 4096, "temperature": 0}
-
-    def test_gpt4_custom_max_tokens(self):
-        from petey.extract import _model_kwargs
-        kw = _model_kwargs("gpt-4.1", max_tokens=8192)
-        assert kw == {"max_tokens": 8192, "temperature": 0}
 
     def test_gpt5_returns_max_completion_tokens(self):
         from petey.extract import _model_kwargs
