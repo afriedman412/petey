@@ -30,6 +30,14 @@ from pydantic import BaseModel
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 from anthropic import AsyncAnthropic
 
+from petey.registries.parsers import API_PARSERS, PLUGIN_PARSERS
+from petey.registries.models import (
+    MODELS, _DEFAULT_MODEL_KWARGS, _REASONING_MODEL_KWARGS,
+)
+from petey.registries.llm_backends import (
+    API_LLM_BACKENDS, PLUGIN_LLM_BACKENDS,
+)
+
 SYSTEM = (
     "You extract structured data from documents. "
     "Use null for missing or unreadable values."
@@ -122,87 +130,11 @@ def _extract_text_pages_pdfplumber(pdf_path: str) -> list[str]:
     return pages
 
 
-# --- Remote API backend infrastructure ---
+# --- Remote API backend dispatch ---
 #
-# Any HTTP service that accepts a file and returns text can be wired in
-# as a parser or OCR backend by adding config to API_PARSERS / API_OCR_BACKENDS.
-# No new functions needed — just a dict.
-#
-# Config keys:
-#   endpoint       — URL to POST the file to (required)
-#   api_key_env    — env var name for the API key (required)
-#   auth_header    — HTTP header name (default: "X-API-Key")
-#   auth_prefix    — prepended to key value, e.g. "Bearer" (default: "")
-#   request_format — how to send the file (default: "multipart")
-#       "multipart"  — standard multipart/form-data file upload
-#       "json_b64"   — base64-encoded file in a JSON body
-#   file_field     — field name for the file in the request (default: "file")
-#   params         — extra form data / JSON fields to include (default: {})
-#   response_key   — dot-path into JSON response for the text (default: "markdown")
-#   poll           — whether to poll a check URL for async results (default: True)
-#   poll_status_key — key to check for completion (default: "status")
-#   poll_done_value — value that means done (default: "complete")
-#   poll_check_key  — key containing the poll URL (default: "request_check_url")
-#   poll_url_template — build poll URL from check_key value via str.format()
-#                       e.g. "https://api.example.com/job/{id}/result"
-#                       when set, poll_check_key is the value to interpolate
-#   poll_header_key — read the poll URL from a response header instead
-#                     of the JSON body (e.g. "Operation-Location" for Azure)
-#   endpoint_env   — env var containing the base URL (for per-user endpoints)
-#   endpoint_suffix — path appended to endpoint_env value
-#   timeout        — max seconds to wait for poll (default: 240)
-#
-# request_format options:
-#   "multipart"  — standard multipart/form-data file upload (default)
-#   "json_b64"   — base64-encoded file in a JSON body
-#   "raw"        — raw file bytes with Content-Type header
-#
-# response_key patterns:
-#   "markdown"    — simple top-level key
-#   "result.text" — dot-separated nested key
-#   "[].text"     — join text from each element in an array response
-
-API_PARSERS: dict[str, dict] = {
-    "datalab": {
-        "name": "Datalab",
-        "role": "parser",
-        "endpoint": "https://www.datalab.to/api/v1/convert",
-        "api_key_env": "DATALAB_API_KEY",
-        "auth_header": "X-API-Key",
-        "params": {"output_format": "markdown"},
-        "response_key": "markdown",
-        "poll": True,
-    },
-    "unstructured_api": {
-        "name": "Unstructured API",
-        "role": "parser",
-        "endpoint": "https://api.unstructuredapp.io/general/v0/general",
-        "api_key_env": "UNSTRUCTURED_API_KEY",
-        "auth_header": "unstructured-api-key",
-        "params": {"strategy": "auto"},
-        "response_key": "[].text",
-        "poll": False,
-    },
-    "azure_documentai": {
-        "name": "Azure Document Intelligence",
-        "role": "parser",
-        "endpoint_env": "AZURE_DOCUMENT_ENDPOINT",
-        "endpoint_suffix": (
-            "/documentintelligence"
-            "/documentModels/prebuilt-read:analyze"
-            "?api-version=2024-11-30"
-        ),
-        "api_key_env": "AZURE_DOCUMENT_KEY",
-        "auth_header": "Ocp-Apim-Subscription-Key",
-        "request_format": "raw",
-        "response_key": "analyzeResult.content",
-        "poll": True,
-        "poll_header_key": "Operation-Location",
-        "poll_status_key": "status",
-        "poll_done_value": "succeeded",
-        "timeout": 120,
-    },
-}
+# The data for API_PARSERS lives in petey.registries.parsers. The helpers
+# below implement the request/response/poll mechanics that interpret that
+# config. See registries/parsers.py for the config schema.
 
 
 def _resolve_response(data, key_path: str) -> str:
@@ -386,31 +318,11 @@ async def _parse_pdf_via_api(pdf_path: str, cfg: dict) -> list[str]:
     return [text] if text else [""]
 
 
-# --- Plugin registries ---
+# --- Plugin loader ---
 #
-# Register local backends that live outside extract.py.  Each entry maps a
-# name to a "module.path:callable" string.  The callable is lazy-imported
-# the first time someone selects that backend, so heavyweight dependencies
-# (like docling) are never loaded unless needed.
-#
-# Callable contracts:
-#   PLUGIN_PARSERS:      (pdf_path: str) -> list[str]  (one string per page)
-#   PLUGIN_OCR_BACKENDS: (page: fitz.Page) -> str
-#   PLUGIN_LLM_BACKENDS: same as _LLM_CLIENT_BUILDERS — a client factory
-#
-# Users can add their own:
-#   from petey.extract import PLUGIN_PARSERS
-#   PLUGIN_PARSERS["my_parser"] = "my_package.pdf:extract_pages"
-
-PLUGIN_PARSERS: dict[str, str] = {
-    "docling": "petey.plugins.docling:extract_pages",
-    "liteparse": "petey.plugins.liteparse:extract_pages",
-    "unstructured": "petey.plugins.unstructured:extract_pages",
-    "textract": "petey.plugins.textract:extract_pages",
-    "google_documentai": "petey.plugins.google_documentai:extract_pages",
-}
-
-PLUGIN_LLM_BACKENDS: dict[str, str] = {}
+# Plugin registry data (PLUGIN_PARSERS, PLUGIN_LLM_BACKENDS) lives in
+# petey.registries.{parsers,llm_backends}. The loader below resolves a
+# "module.path:callable" string into a lazy-imported callable.
 
 
 def _load_plugin(import_path: str):
@@ -537,64 +449,10 @@ def extract_text_pages(
 # --- LLM client ---
 
 
-# --- Model registry ---
+# --- Model dispatch ---
 #
-# Explicit registration of known models. Each entry is a dict with:
-#
-#   provider (required)
-#       Name of the LLM backend. Must be a key in ``LLM_BACKENDS``.
-#       Built-ins: "openai", "azure_openai", "anthropic", "litellm".
-#
-#   config (optional)
-#       Dict of kwargs passed to the backend *builder* (not the
-#       completion call). Lets each model carry its own endpoint,
-#       API version, organisation, and API-key env var — so multiple
-#       deployments of the same backend can coexist in one process
-#       without mutating os.environ.
-#
-#   kwargs (optional)
-#       Dict of kwargs passed to every ``chat.completions.create()``
-#       call. Overrides the default ``{"max_tokens": 4096,
-#       "temperature": 0}``. Use this for reasoning models that need
-#       ``max_completion_tokens`` and reject ``temperature``.
-#
-# Example — one process, two Azure tenants:
-#
-#   MODELS["tenant-a-gpt-4o"] = {
-#       "provider": "azure_openai",
-#       "config": {
-#           "api_version": "2024-06-01",
-#           "azure_endpoint": "https://tenant-a.openai.azure.com",
-#           "api_key_env": "TENANT_A_API_KEY",
-#       },
-#   }
-#   MODELS["tenant-b-gpt-5"] = {
-#       "provider": "azure_openai",
-#       "config": {
-#           "api_version": "2024-10-21",
-#           "azure_endpoint": "https://tenant-b.openai.azure.com",
-#           "api_key_env": "TENANT_B_API_KEY",
-#       },
-#       "kwargs": {"max_completion_tokens": 4096},
-#   }
-
-_DEFAULT_MODEL_KWARGS = {"max_tokens": 4096, "temperature": 0}
-_REASONING_MODEL_KWARGS = {"max_completion_tokens": 4096}
-
-MODELS: dict[str, dict] = {
-    # OpenAI
-    "gpt-4.1":      {"provider": "openai"},
-    "gpt-4.1-mini": {"provider": "openai"},
-    "gpt-4o":       {"provider": "openai"},
-    "gpt-4o-mini":  {"provider": "openai"},
-    "gpt-5":        {"provider": "openai", "kwargs": _REASONING_MODEL_KWARGS},
-    "gpt-5-mini":   {"provider": "openai", "kwargs": _REASONING_MODEL_KWARGS},
-    # Anthropic
-    "claude-opus-4-7":           {"provider": "anthropic"},
-    "claude-sonnet-4-6":         {"provider": "anthropic"},
-    "claude-haiku-4-5-20251001": {"provider": "anthropic"},
-}
-
+# MODELS data lives in petey.registries.models. The functions below
+# resolve a model ID to its provider, API kwargs, and on-the-wire name.
 
 _LITELLM_PREFIXES = (
     "gemini/", "mistral/", "ollama/", "ollama_chat/",
@@ -803,37 +661,17 @@ def _make_client_litellm(api_key: str | None = None, **kwargs):
     return instructor.from_litellm(litellm.acompletion)
 
 
-# --- LLM backend registry ---
+# --- LLM backend dispatch ---
 #
-# Each backend is a callable: (api_key: str | None, **kwargs) -> instructor client
-#
-# Built-in backends handle OpenAI, Anthropic, and litellm (100+ providers).
-# Any OpenAI-compatible API (vLLM, Ollama, Together, etc.) can be used by
-# setting llm_backend="openai" and passing base_url / api_key_env via
-# API_LLM_BACKENDS config.
-#
-# To add a new provider that speaks the OpenAI protocol:
-#
-#   API_LLM_BACKENDS["myhost"] = {
-#       "client": "openai",
-#       "base_url": "https://my-host.com/v1",
-#       "api_key_env": "MYHOST_API_KEY",
-#   }
+# Built-in backends are wired here; pluggable backend data
+# (API_LLM_BACKENDS, PLUGIN_LLM_BACKENDS) lives in
+# petey.registries.llm_backends.
 
 _LLM_CLIENT_BUILDERS = {
     "openai": _make_client_openai,
     "azure_openai": _make_client_azure_openai,
     "anthropic": _make_client_anthropic,
     "litellm": _make_client_litellm,
-}
-
-API_LLM_BACKENDS: dict[str, dict] = {
-    # Example:
-    # "myhost": {
-    #     "client": "openai",          # which builder to use
-    #     "base_url": "https://...",    # OpenAI-compatible endpoint
-    #     "api_key_env": "MYHOST_KEY", # env var for the key
-    # },
 }
 
 
@@ -1692,7 +1530,8 @@ async def extract_pages_async(
         seen.add(key_fields)
         deduped.append(r)
     if dupes:
-        print(f"[petey] deduplicated {dupes} duplicate rows ({len(results)} -> {len(deduped)})", flush=True)
+        print(
+            f"[petey] deduplicated {dupes} duplicate rows ({len(results)} -> {len(deduped)})", flush=True)
     return deduped
 
 
