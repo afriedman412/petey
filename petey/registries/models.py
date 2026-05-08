@@ -61,7 +61,19 @@ MODELS: dict[str, dict] = {
     "claude-opus-4-7":           {"provider": "anthropic"},
     "claude-sonnet-4-6":         {"provider": "anthropic"},
     "claude-haiku-4-5-20251001": {"provider": "anthropic"},
-    # qwen
-    "qwen3-4b":   {"provider": "litellm", "model": "ollama/qwen3:4b"},
-    "qwen2.5-3b": {"provider": "litellm", "model": "ollama/qwen2.5:3b"},
+    # Local — Ollama (deck-defining benchmark path)
+    "qwen3-4b":          {"provider": "ollama", "model": "qwen3:4b"},
+    "qwen2.5-3b":        {"provider": "ollama", "model": "qwen2.5:3b"},
+    "ollama/qwen3:4b":   {"provider": "ollama", "model": "qwen3:4b"},
+    "ollama/qwen2.5:3b": {"provider": "ollama", "model": "qwen2.5:3b"},
+    # Gemini direct
+    "gemini-2.5-flash":        {"provider": "gemini",
+                                "model": "gemini-2.5-flash"},
+    "gemini/gemini-2.5-flash": {"provider": "gemini",
+                                "model": "gemini-2.5-flash"},
+    # OpenAI-compat (config-only, via API_LLM_BACKENDS)
+    "deepseek/deepseek-chat":     {"provider": "deepseek",
+                                   "model": "deepseek-chat"},
+    "deepseek/deepseek-reasoner": {"provider": "deepseek",
+                                   "model": "deepseek-reasoner"},
 }
