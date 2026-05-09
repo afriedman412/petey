@@ -6,10 +6,14 @@ Pipeline architecture::
 
     PDF
      └─ Parser       (pymupdf | pdfplumber | datalab | unstructured | …)
-          └─ LLM     (openai | anthropic | litellm)
+          └─ LLM     (openai | azure_openai | anthropic | ollama |
+                     gemini | anthropic_bedrock | anthropic_vertex |
+                     vertex_ai | API_LLM_BACKENDS catchall | litellm)
                └─ Output  (csv | json | jsonl)
 
 Each layer is swappable via parameters on the public functions.
+LLM dispatch goes through direct, hand-coded backends per provider
+family; ``litellm`` remains as a fallback for the long tail.
 """
 import asyncio
 import base64
@@ -454,11 +458,26 @@ def extract_text_pages(
 # MODELS data lives in petey.registries.models. The functions below
 # resolve a model ID to its provider, API kwargs, and on-the-wire name.
 
+# Prefixes that route to direct (non-litellm) backends. The prefix
+# is stripped from the model identifier before the API call (the
+# wire-format name on each provider has no Petey-side prefix).
+_DIRECT_PREFIX_PROVIDERS = {
+    "ollama/": "ollama",
+    "ollama_chat/": "ollama",
+    "gemini/": "gemini",
+    "deepseek/": "deepseek",
+    "mistral/": "mistral",
+    "together_ai/": "together",
+    "openrouter/": "openrouter",
+    "fireworks_ai/": "fireworks",
+    "groq/": "groq",
+}
+
+# Long-tail prefixes that fall back to litellm. The prefix stays in
+# the model string since litellm uses it for routing.
 _LITELLM_PREFIXES = (
-    "gemini/", "mistral/", "ollama/", "ollama_chat/",
     "bedrock/", "vertex_ai/", "cohere/", "replicate/",
-    "huggingface/", "together_ai/", "openrouter/",
-    "fireworks_ai/", "deepseek/",
+    "huggingface/",
 )
 
 
@@ -466,6 +485,9 @@ def _infer_provider(model: str) -> str | None:
     """Prefix-based provider inference. Returns None if unrecognised."""
     if model.startswith("claude"):
         return "anthropic"
+    for prefix, provider in _DIRECT_PREFIX_PROVIDERS.items():
+        if model.startswith(prefix):
+            return provider
     if any(model.startswith(p) for p in _LITELLM_PREFIXES):
         return "litellm"
     if (
@@ -505,15 +527,20 @@ def _model_kwargs(model: str) -> dict:
 def _resolve_api_model(model: str) -> str:
     """Resolve a registry key to the identifier the API expects.
 
-    Returns the registry entry's ``model`` field if set, otherwise
-    returns the key unchanged. This lets a registry entry serve as
-    an alias (e.g. ``tenant-a-gpt-4o`` → Azure deployment
-    ``gpt-4o``), so multiple backends exposing the same underlying
-    model can coexist under distinct petey-side names.
+    Returns the registry entry's ``model`` field if set. Otherwise,
+    strips any direct-backend routing prefix (e.g. ``ollama/`` →
+    ``""``), since the wire-format name on each provider has no
+    Petey-side prefix. Registry entries can still serve as aliases
+    (e.g. ``tenant-a-gpt-4o`` → Azure deployment ``gpt-4o``), so
+    multiple backends exposing the same underlying model can coexist
+    under distinct petey-side names.
     """
     entry = MODELS.get(model)
     if entry is not None and "model" in entry:
         return entry["model"]
+    for prefix in _DIRECT_PREFIX_PROVIDERS:
+        if model.startswith(prefix):
+            return model[len(prefix):]
     return model
 
 
@@ -561,8 +588,11 @@ def _get_provider(model: str, llm_backend: str | None = None) -> str:
 def _make_client_openai(api_key: str | None = None, **kwargs):
     """Build an instructor-wrapped OpenAI async client.
 
-    Also handles any OpenAI-compatible endpoint (vLLM, Ollama,
-    Together, etc.) via the ``base_url`` kwarg.
+    Also handles any OpenAI-compatible endpoint (vLLM, DeepSeek,
+    Together, OpenRouter, …) via the ``base_url`` kwarg. Accepts an
+    optional ``mode`` kwarg to override instructor's default
+    (``Mode.TOOLS``); ``Mode.JSON`` is the safest universal contract
+    for OpenAI-compat catchall providers.
     """
     env_var = kwargs.get("api_key_env", "OPENAI_API_KEY")
     key = api_key or os.environ.get(env_var)
@@ -581,7 +611,11 @@ def _make_client_openai(api_key: str | None = None, **kwargs):
         client_kwargs["base_url"] = base_url
     if organization:
         client_kwargs["organization"] = organization
-    return instructor.from_openai(AsyncOpenAI(**client_kwargs))
+    mode = kwargs.get("mode")
+    inst_kwargs = {"mode": mode} if mode is not None else {}
+    return instructor.from_openai(
+        AsyncOpenAI(**client_kwargs), **inst_kwargs,
+    )
 
 
 def _make_client_azure_openai(api_key: str | None = None, **kwargs):
@@ -635,13 +669,19 @@ def _make_client_azure_openai(api_key: str | None = None, **kwargs):
     }
     if organization:
         client_kwargs["organization"] = organization
+    mode = kwargs.get("mode")
+    inst_kwargs = {"mode": mode} if mode is not None else {}
     return instructor.from_openai(
-        AsyncAzureOpenAI(**client_kwargs),
+        AsyncAzureOpenAI(**client_kwargs), **inst_kwargs,
     )
 
 
 def _make_client_anthropic(api_key: str | None = None, **kwargs):
-    """Build an instructor-wrapped Anthropic async client."""
+    """Build an instructor-wrapped Anthropic async client.
+
+    Defaults to instructor's ``Mode.ANTHROPIC_TOOLS``; override via
+    the ``mode`` kwarg.
+    """
     env_var = kwargs.get("api_key_env", "ANTHROPIC_API_KEY")
     key = api_key or os.environ.get(env_var)
     if not key:
@@ -649,13 +689,216 @@ def _make_client_anthropic(api_key: str | None = None, **kwargs):
             f"Missing API key for Anthropic (llm). "
             f"Set {env_var} in your .env file or environment."
         )
+    mode = kwargs.get("mode")
+    inst_kwargs = {"max_tokens": 16384}
+    if mode is not None:
+        inst_kwargs["mode"] = mode
     return instructor.from_anthropic(
-        AsyncAnthropic(api_key=key), max_tokens=16384,
+        AsyncAnthropic(api_key=key), **inst_kwargs,
     )
 
 
+def _make_client_ollama(api_key: str | None = None, **kwargs):
+    """Build an instructor-wrapped Ollama async client.
+
+    Targets Ollama's OpenAI-compatible endpoint (default
+    ``http://localhost:11434/v1``) and defaults to ``Mode.JSON`` —
+    Ollama's tool-calling-via-OpenAI-shim returns empty tool_calls
+    for several models (qwen3 in particular), which trips instructor.
+    Plain JSON mode is the reliable path for the local benchmark.
+
+    Config kwargs (each via env var or registry ``config``):
+        base_url    — OLLAMA_BASE_URL (default localhost:11434/v1)
+        api_key_env — env var for an optional auth token
+        mode        — instructor.Mode override (default Mode.JSON)
+    """
+    base_url = (
+        kwargs.get("base_url")
+        or os.environ.get("OLLAMA_BASE_URL")
+        or "http://localhost:11434/v1"
+    )
+    env_var = kwargs.get("api_key_env", "OLLAMA_API_KEY")
+    # Ollama's OpenAI-compat endpoint accepts any string; OpenAI's
+    # client requires a non-empty api_key, so fall back to a literal.
+    key = api_key or os.environ.get(env_var) or "ollama"
+    mode = kwargs.get("mode", instructor.Mode.JSON)
+    return instructor.from_openai(
+        AsyncOpenAI(api_key=key, base_url=base_url),
+        mode=mode,
+    )
+
+
+def _make_client_gemini(api_key: str | None = None, **kwargs):
+    """Build an instructor-wrapped Gemini async client.
+
+    Uses the ``google-genai`` SDK directly (lazy-imported). Defaults
+    to ``Mode.GENAI_TOOLS``; pass ``mode=instructor.Mode.GENAI_STRUCTURED_OUTPUTS``
+    via config for native ``responseSchema`` constrained decoding.
+    """
+    env_var = kwargs.get("api_key_env", "GEMINI_API_KEY")
+    key = (
+        api_key
+        or os.environ.get(env_var)
+        or os.environ.get("GOOGLE_API_KEY")
+    )
+    if not key:
+        raise ValueError(
+            f"Missing API key for Gemini (llm). "
+            f"Set {env_var} (or GOOGLE_API_KEY) in your .env file "
+            f"or environment."
+        )
+    try:
+        from google import genai
+    except ImportError as e:
+        raise ImportError(
+            "The 'gemini' backend requires google-genai. "
+            "Install with: pip install google-genai"
+        ) from e
+    if not hasattr(instructor, "from_genai"):
+        raise ImportError(
+            "instructor.from_genai is unavailable — install "
+            "google-genai so instructor exposes the helper."
+        )
+    mode = kwargs.get("mode", instructor.Mode.GENAI_TOOLS)
+    return instructor.from_genai(
+        genai.Client(api_key=key), mode=mode, use_async=True,
+    )
+
+
+def _make_client_anthropic_bedrock(api_key: str | None = None, **kwargs):
+    """Build an instructor-wrapped Claude-on-Bedrock async client.
+
+    Auth via the boto3 chain — explicit kwargs/env vars
+    (``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, ``AWS_REGION``,
+    ``AWS_SESSION_TOKEN``, ``AWS_PROFILE``) or shared config
+    (``~/.aws/credentials``, IAM role, …).
+    """
+    try:
+        from anthropic import AsyncAnthropicBedrock
+    except ImportError as e:
+        raise ImportError(
+            "The 'anthropic_bedrock' backend requires the anthropic "
+            "package with bedrock support."
+        ) from e
+    client_kwargs: dict = {}
+    for kw_name, env_name in (
+        ("aws_access_key", "AWS_ACCESS_KEY_ID"),
+        ("aws_secret_key", "AWS_SECRET_ACCESS_KEY"),
+        ("aws_session_token", "AWS_SESSION_TOKEN"),
+        ("aws_region", "AWS_REGION"),
+        ("aws_profile", "AWS_PROFILE"),
+    ):
+        v = kwargs.get(kw_name) or os.environ.get(env_name)
+        if v:
+            client_kwargs[kw_name] = v
+    mode = kwargs.get("mode")
+    inst_kwargs = {"max_tokens": 16384}
+    if mode is not None:
+        inst_kwargs["mode"] = mode
+    return instructor.from_anthropic(
+        AsyncAnthropicBedrock(**client_kwargs), **inst_kwargs,
+    )
+
+
+def _make_client_anthropic_vertex(api_key: str | None = None, **kwargs):
+    """Build an instructor-wrapped Claude-on-Vertex async client.
+
+    Auth via GCP application-default credentials (typically
+    ``GOOGLE_APPLICATION_CREDENTIALS``), plus ``project_id`` and
+    ``region``. Config kwargs / env var fallbacks:
+        project_id — ANTHROPIC_VERTEX_PROJECT_ID, GOOGLE_CLOUD_PROJECT
+        region     — ANTHROPIC_VERTEX_REGION,    CLOUD_ML_REGION
+    """
+    try:
+        from anthropic import AsyncAnthropicVertex
+    except ImportError as e:
+        raise ImportError(
+            "The 'anthropic_vertex' backend requires the anthropic "
+            "package with vertex support."
+        ) from e
+    project_id = (
+        kwargs.get("project_id")
+        or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
+        or os.environ.get("GOOGLE_CLOUD_PROJECT")
+    )
+    region = (
+        kwargs.get("region")
+        or os.environ.get("ANTHROPIC_VERTEX_REGION")
+        or os.environ.get("CLOUD_ML_REGION")
+    )
+    if not project_id:
+        raise ValueError(
+            "anthropic_vertex requires project_id "
+            "(or ANTHROPIC_VERTEX_PROJECT_ID / GOOGLE_CLOUD_PROJECT)."
+        )
+    if not region:
+        raise ValueError(
+            "anthropic_vertex requires region "
+            "(or ANTHROPIC_VERTEX_REGION / CLOUD_ML_REGION)."
+        )
+    mode = kwargs.get("mode")
+    inst_kwargs = {"max_tokens": 16384}
+    if mode is not None:
+        inst_kwargs["mode"] = mode
+    return instructor.from_anthropic(
+        AsyncAnthropicVertex(project_id=project_id, region=region),
+        **inst_kwargs,
+    )
+
+
+def _make_client_vertex_ai(api_key: str | None = None, **kwargs):
+    """Build an instructor-wrapped Vertex AI async client.
+
+    Generic GCP Vertex backend — Gemini, Gemma, Llama, Mistral on
+    Vertex. Uses google-genai with the Vertex backend
+    (``vertexai=True``). Auth via GCP application-default
+    credentials.
+
+    Config kwargs / env var fallbacks:
+        project  — GOOGLE_CLOUD_PROJECT
+        location — GOOGLE_CLOUD_LOCATION (default ``us-central1``)
+    """
+    try:
+        from google import genai
+    except ImportError as e:
+        raise ImportError(
+            "The 'vertex_ai' backend requires google-genai. "
+            "Install with: pip install google-genai"
+        ) from e
+    if not hasattr(instructor, "from_genai"):
+        raise ImportError(
+            "instructor.from_genai is unavailable — install "
+            "google-genai so instructor exposes the helper."
+        )
+    project = (
+        kwargs.get("project")
+        or os.environ.get("GOOGLE_CLOUD_PROJECT")
+    )
+    location = (
+        kwargs.get("location")
+        or os.environ.get("GOOGLE_CLOUD_LOCATION")
+        or "us-central1"
+    )
+    if not project:
+        raise ValueError(
+            "vertex_ai backend requires project "
+            "(or GOOGLE_CLOUD_PROJECT)."
+        )
+    mode = kwargs.get("mode", instructor.Mode.GENAI_TOOLS)
+    client = genai.Client(
+        vertexai=True, project=project, location=location,
+    )
+    return instructor.from_genai(client, mode=mode, use_async=True)
+
+
 def _make_client_litellm(api_key: str | None = None, **kwargs):
-    """Build an instructor-wrapped litellm client."""
+    """Build an instructor-wrapped litellm client.
+
+    Catchall for the long-tail providers we don't have a direct
+    backend for. Production-critical paths (Ollama, Gemini,
+    OpenAI-compat hosts, Anthropic platforms) route through their
+    own dedicated builders rather than this fallback.
+    """
     import litellm
     litellm.drop_params = True
     return instructor.from_litellm(litellm.acompletion)
@@ -671,6 +914,11 @@ _LLM_CLIENT_BUILDERS = {
     "openai": _make_client_openai,
     "azure_openai": _make_client_azure_openai,
     "anthropic": _make_client_anthropic,
+    "ollama": _make_client_ollama,
+    "gemini": _make_client_gemini,
+    "anthropic_bedrock": _make_client_anthropic_bedrock,
+    "anthropic_vertex": _make_client_anthropic_vertex,
+    "vertex_ai": _make_client_vertex_ai,
     "litellm": _make_client_litellm,
 }
 

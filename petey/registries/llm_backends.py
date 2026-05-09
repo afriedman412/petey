@@ -20,13 +20,49 @@ To add a new provider that speaks the OpenAI protocol::
     }
 """
 
+import instructor
+
 API_LLM_BACKENDS: dict[str, dict] = {
-    # Example:
-    # "myhost": {
-    #     "client": "openai",          # which builder to use
-    #     "base_url": "https://...",    # OpenAI-compatible endpoint
-    #     "api_key_env": "MYHOST_KEY", # env var for the key
-    # },
+    # OpenAI-compatible HTTP endpoints. Each speaks the OpenAI
+    # protocol well enough that we don't need a dedicated builder —
+    # just a base_url, an API-key env var, and (where the provider's
+    # tool-call shim is shaky) Mode.JSON to keep the surface stable.
+    "deepseek": {
+        "client": "openai",
+        "base_url": "https://api.deepseek.com/v1",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "mode": instructor.Mode.JSON,
+    },
+    "mistral": {
+        "client": "openai",
+        "base_url": "https://api.mistral.ai/v1",
+        "api_key_env": "MISTRAL_API_KEY",
+        "mode": instructor.Mode.JSON,
+    },
+    "together": {
+        "client": "openai",
+        "base_url": "https://api.together.xyz/v1",
+        "api_key_env": "TOGETHER_API_KEY",
+        "mode": instructor.Mode.JSON,
+    },
+    "openrouter": {
+        "client": "openai",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "mode": instructor.Mode.JSON,
+    },
+    "fireworks": {
+        "client": "openai",
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "api_key_env": "FIREWORKS_API_KEY",
+        "mode": instructor.Mode.JSON,
+    },
+    "groq": {
+        "client": "openai",
+        "base_url": "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+        "mode": instructor.Mode.JSON,
+    },
 }
 
 PLUGIN_LLM_BACKENDS: dict[str, str] = {}

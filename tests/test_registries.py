@@ -1,6 +1,7 @@
 """Tests for parser/LLM registries, plugins, backend options, and provider detection."""
 import asyncio
 import os
+import textwrap
 from pathlib import Path
 from unittest.mock import (
     MagicMock, patch,
@@ -32,8 +33,22 @@ class TestRegistries:
 
     def test_llm_registry_has_builtins(self):
         from petey.extract import LLM_BACKENDS
-        for name in ["openai", "anthropic", "litellm"]:
+        for name in [
+            "openai", "azure_openai", "anthropic",
+            "ollama", "gemini",
+            "anthropic_bedrock", "anthropic_vertex", "vertex_ai",
+            "litellm",
+        ]:
             assert name in LLM_BACKENDS, f"Missing LLM: {name}"
+
+    def test_llm_registry_has_api_backends(self):
+        """Config-only OpenAI-compat providers should be live."""
+        from petey.extract import LLM_BACKENDS
+        for name in [
+            "deepseek", "mistral", "together",
+            "openrouter", "fireworks", "groq",
+        ]:
+            assert name in LLM_BACKENDS, f"Missing API backend: {name}"
 
     def test_api_parsers_config_valid(self):
         from petey.extract import API_PARSERS
@@ -208,6 +223,72 @@ class TestModelsRegistryConfig:
             del MODELS["_t_b"]
 
 
+class TestNewLLMBuilders:
+    """Verify the direct-backend builders wire up correctly."""
+
+    def test_ollama_builder_uses_localhost_default(self):
+        from petey.extract import _make_client_ollama
+        with patch("petey.extract.AsyncOpenAI") as mock_oai:
+            with patch("petey.extract.instructor") as mock_inst:
+                mock_inst.Mode.JSON = "Mode.JSON"
+                mock_inst.from_openai.return_value = "client"
+                _make_client_ollama()
+        mock_oai.assert_called_once()
+        kw = mock_oai.call_args.kwargs
+        assert kw["base_url"] == "http://localhost:11434/v1"
+        # OpenAI client requires non-empty api_key
+        assert kw["api_key"]
+
+    def test_ollama_builder_respects_base_url_kwarg(self):
+        from petey.extract import _make_client_ollama
+        with patch("petey.extract.AsyncOpenAI") as mock_oai:
+            with patch("petey.extract.instructor") as mock_inst:
+                mock_inst.from_openai.return_value = "client"
+                _make_client_ollama(base_url="http://h:9999/v1")
+        assert mock_oai.call_args.kwargs["base_url"] == "http://h:9999/v1"
+
+    def test_qwen_alias_routes_to_ollama(self):
+        from petey.extract import _get_provider, _resolve_api_model
+        assert _get_provider("qwen3-4b") == "ollama"
+        assert _resolve_api_model("qwen3-4b") == "qwen3:4b"
+
+    def test_deepseek_via_api_backend(self):
+        from petey.extract import _make_client
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k"}):
+            with patch("petey.extract.AsyncOpenAI") as mock_oai:
+                with patch("petey.extract.instructor") as mock_inst:
+                    mock_inst.from_openai.return_value = "c"
+                    _make_client("deepseek/deepseek-chat")
+        kw = mock_oai.call_args.kwargs
+        assert kw["api_key"] == "k"
+        assert kw["base_url"] == "https://api.deepseek.com/v1"
+
+    def test_anthropic_bedrock_builder_passes_aws_creds(self):
+        from petey.extract import _make_client_anthropic_bedrock
+        env = {
+            "AWS_ACCESS_KEY_ID": "akid",
+            "AWS_SECRET_ACCESS_KEY": "secret",
+            "AWS_REGION": "us-west-2",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch(
+                "anthropic.AsyncAnthropicBedrock",
+            ) as mock_b:
+                with patch("petey.extract.instructor") as mock_inst:
+                    mock_inst.from_anthropic.return_value = "c"
+                    _make_client_anthropic_bedrock()
+        kw = mock_b.call_args.kwargs
+        assert kw["aws_access_key"] == "akid"
+        assert kw["aws_secret_key"] == "secret"
+        assert kw["aws_region"] == "us-west-2"
+
+    def test_anthropic_vertex_builder_requires_project_and_region(self):
+        from petey.extract import _make_client_anthropic_vertex
+        with patch.dict(os.environ, {}, clear=True):
+            with pytest.raises(ValueError, match="project_id"):
+                _make_client_anthropic_vertex()
+
+
 class TestPluginRegistries:
     """Test the PLUGIN_* registries and lazy loader."""
 
@@ -262,14 +343,50 @@ class TestBackendOptions:
         assert kwargs["dpi"] == 300
 
 
-class TestLitellmRouting:
-    def test_fireworks_routes_to_litellm(self):
-        from petey.extract import _get_provider
-        assert _get_provider("fireworks_ai/accounts/fireworks/models/llama-v3p3-70b-instruct") == "litellm"
+class TestDirectPrefixRouting:
+    """Provider prefixes that route to direct (non-litellm) backends."""
 
-    def test_deepseek_routes_to_litellm(self):
+    def test_fireworks_routes_direct(self):
         from petey.extract import _get_provider
-        assert _get_provider("deepseek/deepseek-chat") == "litellm"
+        assert _get_provider(
+            "fireworks_ai/accounts/fireworks/models/llama-v3p3-70b-instruct"
+        ) == "fireworks"
+
+    def test_deepseek_routes_direct(self):
+        from petey.extract import _get_provider
+        assert _get_provider(
+            "deepseek/deepseek-not-yet-registered",
+        ) == "deepseek"
+
+    def test_ollama_routes_direct(self):
+        from petey.extract import _get_provider
+        assert _get_provider("ollama/llama3") == "ollama"
+
+    def test_gemini_routes_direct(self):
+        from petey.extract import _get_provider
+        assert _get_provider("gemini/gemini-2.0-flash") == "gemini"
+
+    def test_direct_prefix_stripped_from_api_model(self):
+        """For unregistered prefixed models, the prefix should be
+        stripped before the wire call (the provider doesn't speak the
+        Petey-side prefix)."""
+        from petey.extract import _resolve_api_model
+        assert _resolve_api_model(
+            "deepseek/deepseek-not-yet-registered",
+        ) == "deepseek-not-yet-registered"
+        assert _resolve_api_model("ollama/llama3") == "llama3"
+
+
+class TestLitellmRouting:
+    def test_bedrock_routes_to_litellm(self):
+        from petey.extract import _get_provider
+        assert _get_provider(
+            "bedrock/anthropic.claude-v2",
+        ) == "litellm"
+
+    def test_huggingface_routes_to_litellm(self):
+        from petey.extract import _get_provider
+        assert _get_provider("huggingface/some-model") == "litellm"
 
 
 class TestProviderDetection:
@@ -298,26 +415,15 @@ class TestProviderDetection:
             "my-azure-deployment", llm_backend="azure_openai",
         ) == "azure_openai"
 
-    def test_litellm_gemini(self):
-        from petey.extract import _get_provider
-        assert _get_provider("gemini/gemini-2.0-flash") == "litellm"
-
-    def test_litellm_ollama(self):
-        from petey.extract import _get_provider
-        assert _get_provider("ollama/llama3") == "litellm"
-
-    def test_litellm_bedrock(self):
-        from petey.extract import _get_provider
-        assert _get_provider("bedrock/anthropic.claude-v2") == "litellm"
-
     def test_explicit_backend_override(self):
         from petey.extract import _get_provider
         assert _get_provider("gpt-4.1-mini", llm_backend="litellm") == "litellm"
         assert _get_provider("claude-sonnet-4-6", llm_backend="openai") == "openai"
 
     def test_litellm_client_created(self):
+        """Long-tail providers still build a litellm client."""
         from petey.extract import _make_client
-        client = _make_client("gemini/gemini-2.0-flash")
+        client = _make_client("bedrock/anthropic.claude-v2")
         assert client is not None
 
 
@@ -369,3 +475,126 @@ class TestMakeMessages:
         from petey.extract import _make_messages
         msgs = _make_messages("doc text")
         assert "Additional instructions" not in msgs[0]["content"]
+
+
+class TestUserModelsConfig:
+    """User-config YAML loader merges into MODELS at import time
+    and via per-run overrides."""
+
+    def _write_yaml(self, tmp_path, body: str) -> Path:
+        p = tmp_path / "models.yaml"
+        p.write_text(textwrap.dedent(body))
+        return p
+
+    def test_load_models_file_parses_entry(self, tmp_path):
+        from petey.registries.models import load_models_file
+        p = self._write_yaml(tmp_path, """\
+            tenant-a-gpt-4o:
+              provider: azure_openai
+              model: gpt-4o
+              config:
+                api_version: "2024-06-01"
+                azure_endpoint: https://a.azure.test
+                api_key_env: TENANT_A_KEY
+        """)
+        data = load_models_file(p)
+        assert "tenant-a-gpt-4o" in data
+        entry = data["tenant-a-gpt-4o"]
+        assert entry["provider"] == "azure_openai"
+        assert entry["config"]["api_version"] == "2024-06-01"
+
+    def test_load_models_file_rejects_non_mapping(self, tmp_path):
+        from petey.registries.models import load_models_file
+        p = self._write_yaml(tmp_path, "- just\n- a\n- list\n")
+        with pytest.raises(ValueError, match="must be a YAML mapping"):
+            load_models_file(p)
+
+    def test_load_models_file_rejects_missing_provider(self, tmp_path):
+        from petey.registries.models import load_models_file
+        p = self._write_yaml(tmp_path, """\
+            broken:
+              model: foo
+        """)
+        with pytest.raises(ValueError, match="must be a dict with"):
+            load_models_file(p)
+
+    def test_register_models_overrides_builtin(self):
+        from petey.registries.models import (
+            MODELS, register_models, model_source,
+        )
+        original = dict(MODELS["gpt-4o"])
+        try:
+            register_models(
+                {"gpt-4o": {"provider": "anthropic"}},
+                source="test-override",
+            )
+            assert MODELS["gpt-4o"]["provider"] == "anthropic"
+            assert model_source("gpt-4o") == "test-override"
+        finally:
+            MODELS["gpt-4o"] = original
+            # Restore the source by re-registering as built-in
+            register_models({"gpt-4o": original}, source="built-in")
+
+    def test_register_models_tracks_source(self):
+        from petey.registries.models import (
+            MODELS, register_models, model_source,
+        )
+        try:
+            register_models(
+                {"_test_user_model": {"provider": "openai"}},
+                source="/some/path/models.yaml",
+            )
+            assert "_test_user_model" in MODELS
+            assert (
+                model_source("_test_user_model")
+                == "/some/path/models.yaml"
+            )
+        finally:
+            del MODELS["_test_user_model"]
+
+    def test_user_models_path_respects_env_var(self, monkeypatch):
+        from petey.registries.models import user_models_path
+        monkeypatch.setenv("PETEY_MODELS", "/custom/path/m.yaml")
+        assert str(user_models_path()) == "/custom/path/m.yaml"
+
+    def test_user_models_path_default(self, monkeypatch):
+        from petey.registries.models import (
+            user_models_path, DEFAULT_USER_MODELS_PATH,
+        )
+        monkeypatch.delenv("PETEY_MODELS", raising=False)
+        assert user_models_path() == DEFAULT_USER_MODELS_PATH
+
+    def test_user_models_routed_via_make_client(self, tmp_path):
+        """End-to-end: a user-config Azure entry should reach the
+        Azure builder when _make_client is called by name."""
+        from petey.registries.models import (
+            MODELS, load_models_file, register_models,
+        )
+        from petey.extract import _make_client
+        p = self._write_yaml(tmp_path, """\
+            my-azure-deployment:
+              provider: azure_openai
+              model: gpt-4o
+              config:
+                api_version: "2024-06-01"
+                azure_endpoint: https://my-tenant.azure.test
+                api_key_env: MY_AZURE_KEY
+        """)
+        register_models(load_models_file(p), source=str(p))
+        try:
+            with patch.dict(os.environ, {"MY_AZURE_KEY": "k"}):
+                with patch(
+                    "petey.extract.AsyncAzureOpenAI",
+                ) as mock_az:
+                    with patch(
+                        "petey.extract.instructor",
+                    ) as mock_inst:
+                        mock_inst.from_openai.return_value = "cli"
+                        _make_client("my-azure-deployment")
+            mock_az.assert_called_once()
+            kw = mock_az.call_args.kwargs
+            assert kw["api_key"] == "k"
+            assert kw["api_version"] == "2024-06-01"
+            assert kw["azure_endpoint"] == "https://my-tenant.azure.test"
+        finally:
+            del MODELS["my-azure-deployment"]
