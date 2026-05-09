@@ -14,7 +14,7 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 import yaml
 
@@ -25,6 +25,44 @@ from petey.extract import (
     API_PARSERS, PLUGIN_PARSERS,
     PLUGIN_LLM_BACKENDS,
 )
+from petey.registries.models import (
+    MODELS, load_models_file, register_models, model_source,
+    user_models_path, DEFAULT_USER_MODELS_PATH,
+)
+
+
+_USER_MODELS_TEMPLATE = """\
+# Petey user model registry. Entries here augment the built-in
+# MODELS registry; on key collision, this file wins. Each entry:
+#
+#   <name>:
+#     provider: <backend name from `petey list llm`>
+#     model:    <wire-format model name on the provider, if it
+#                differs from <name>>
+#     config:   <optional kwargs forwarded to the backend builder>
+#     kwargs:   <optional kwargs forwarded to chat.completions.create>
+#
+# Run `petey models list` to see what's currently registered.
+
+# Example — Azure OpenAI deployment:
+#
+# my-azure-gpt-4o:
+#   provider: azure_openai
+#   model: gpt-4o          # the deployment name on Azure
+#   config:
+#     api_version: "2024-06-01"
+#     azure_endpoint: https://your-tenant.openai.azure.com
+#     api_key_env: MY_AZURE_KEY
+#     organization: "12345"
+
+# Example — custom Ollama host:
+#
+# remote-qwen:
+#   provider: ollama
+#   model: qwen2.5:7b
+#   config:
+#     base_url: http://gpu-box.local:11434/v1
+"""
 
 
 def _collect_pdfs(paths: list[str]) -> list[str]:
@@ -72,7 +110,11 @@ def _flatten(records: list[dict]) -> tuple[list[dict], list[str]]:
 
 
 def main():
-    load_dotenv()
+    # find_dotenv(usecwd=True) walks up from the user's working
+    # directory; the default walks up from this module's location,
+    # which makes `petey` pick up a .env from wherever petey itself
+    # is installed.
+    load_dotenv(find_dotenv(usecwd=True))
 
     parser = argparse.ArgumentParser(
         prog="petey",
@@ -89,6 +131,23 @@ def main():
     ext.add_argument(
         "--model", "-m", default=None,
         help="Model ID (default: gpt-4.1-mini)",
+    )
+    ext.add_argument(
+        "--llm-backend", default=None,
+        help=(
+            "Override the LLM backend (e.g. azure_openai). Useful "
+            "when the model name's default backend isn't right — "
+            "e.g. running gpt-4o through Azure rather than openai. "
+            "Backend reads its config from env vars."
+        ),
+    )
+    ext.add_argument(
+        "--models-config", default=None,
+        help=(
+            "Path to a YAML file of model registry entries to merge "
+            "for this run only (in addition to the built-in registry "
+            "and ~/.petey/models.yaml)."
+        ),
     )
     ext.add_argument(
         "--concurrency", "-c", type=int, default=10,
@@ -151,6 +210,15 @@ def main():
         help="Model ID (default: gpt-4.1-mini)",
     )
     inf.add_argument(
+        "--llm-backend", default=None,
+        help="Override the LLM backend (see `extract --llm-backend`).",
+    )
+    inf.add_argument(
+        "--models-config", default=None,
+        help="Path to a YAML file of model registry entries to merge "
+             "for this run only.",
+    )
+    inf.add_argument(
         "--max-pages", type=int, default=2,
         help="Pages to sample (default: 2)",
     )
@@ -175,6 +243,29 @@ def main():
         help="Which backends to list (default: all)",
     )
 
+    # --- models subcommand ---
+    mdl = sub.add_parser(
+        "models",
+        help="Inspect and manage the model registry",
+    )
+    mdl_sub = mdl.add_subparsers(dest="models_action")
+    mdl_sub.add_parser(
+        "list", help="List registered models with their source",
+    )
+    mdl_sub.add_parser(
+        "path",
+        help="Print the resolved user-config models path",
+    )
+    init_p = mdl_sub.add_parser(
+        "init",
+        help="Write a commented template to the user-config path "
+             "(only if the file does not already exist)",
+    )
+    init_p.add_argument(
+        "--force", action="store_true",
+        help="Overwrite an existing file. Otherwise refuses.",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -187,9 +278,23 @@ def main():
         run_infer_schema(args)
     elif args.command == "list":
         run_list(args)
+    elif args.command == "models":
+        run_models(args)
+
+
+def _apply_models_config(path: str | None) -> None:
+    """Merge a per-run models YAML into MODELS, if a path is given."""
+    if not path:
+        return
+    p = Path(path)
+    if not p.exists():
+        print(f"--models-config: file not found: {p}", file=sys.stderr)
+        sys.exit(1)
+    register_models(load_models_file(p), source=str(p))
 
 
 def run_extract(args):
+    _apply_models_config(args.models_config)
     response_model, spec = load_schema(args.schema)
 
     # Input: CLI paths override schema input
@@ -329,6 +434,7 @@ def run_extract(args):
                 extract_pages_async(
                     pdf, response_model,
                     model=model,
+                    llm_backend=args.llm_backend,
                     instructions=instructions,
                     pages_per_chunk=pages_per_chunk,
                     concurrency=args.concurrency,
@@ -361,6 +467,7 @@ def run_extract(args):
             extract_batch(
                 pdfs, response_model,
                 model=model,
+                llm_backend=args.llm_backend,
                 instructions=instructions,
                 concurrency=args.concurrency,
                 on_result=on_result,
@@ -425,6 +532,7 @@ def run_extract(args):
 
 
 def run_infer_schema(args):
+    _apply_models_config(args.models_config)
     model = (
         args.model
         or os.environ.get("PETEY_MODEL", "gpt-4.1-mini")
@@ -438,6 +546,7 @@ def run_infer_schema(args):
     spec = infer_schema(
         args.pdf,
         model=model,
+        llm_backend=args.llm_backend,
         parser=args.parser,
         max_pages=args.max_pages,
     )
@@ -471,6 +580,42 @@ def _backend_type(name, api_dict, plugin_dict):
     if name in api_dict:
         return "api"
     return "built-in"
+
+
+def run_models(args):
+    action = args.models_action or "list"
+    if action == "path":
+        path = user_models_path()
+        print(path)
+        if not path.exists():
+            print(
+                "(file does not exist — run `petey models init` "
+                "to create a template)",
+                file=sys.stderr,
+            )
+        return
+    if action == "init":
+        path = user_models_path()
+        if path.exists() and not args.force:
+            print(
+                f"Refusing to overwrite existing file: {path}\n"
+                f"Use --force to overwrite.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_USER_MODELS_TEMPLATE)
+        print(f"Wrote template to {path}", file=sys.stderr)
+        return
+    # list
+    print()
+    print(f"{'name':40s}  {'provider':20s}  source")
+    print(f"{'-' * 40}  {'-' * 20}  ------")
+    for name in sorted(MODELS):
+        entry = MODELS[name]
+        src = model_source(name)
+        print(f"{name:40s}  {entry['provider']:20s}  {src}")
+    print()
 
 
 def run_list(args):

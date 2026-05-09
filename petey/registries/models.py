@@ -1,4 +1,10 @@
-"""Model registry — data only.
+"""Model registry — data, plus a user-config loader.
+
+Built-in entries below are augmented at import time by an optional
+user-side YAML file (``~/.petey/models.yaml`` by default, or
+``$PETEY_MODELS``). User-config entries override built-ins on key
+collision. Set ``PETEY_DISABLE_USER_MODELS=1`` to skip the file
+(used in tests to keep the registry deterministic).
 
 Explicit registration of known models. Each entry in ``MODELS`` is a
 dict with:
@@ -77,3 +83,88 @@ MODELS: dict[str, dict] = {
     "deepseek/deepseek-reasoner": {"provider": "deepseek",
                                    "model": "deepseek-reasoner"},
 }
+
+
+# --- User-config loader ---
+#
+# Tracks where each registry entry came from so `petey models list`
+# can show built-in vs. user-config provenance.
+import os
+from pathlib import Path
+
+_BUILTIN_KEYS = frozenset(MODELS)
+_MODEL_SOURCES: dict[str, str] = {k: "built-in" for k in MODELS}
+
+DEFAULT_USER_MODELS_PATH = Path.home() / ".petey" / "models.yaml"
+
+
+def user_models_path() -> Path:
+    """Resolve the user-config models YAML path.
+
+    ``PETEY_MODELS`` env var wins; otherwise defaults to
+    ``~/.petey/models.yaml``.
+    """
+    env = os.environ.get("PETEY_MODELS")
+    return Path(env) if env else DEFAULT_USER_MODELS_PATH
+
+
+def load_models_file(path) -> dict[str, dict]:
+    """Parse a models YAML file and return the dict.
+
+    Raises ``ValueError`` if the file isn't a mapping of
+    ``name -> entry``. Lazy-imports yaml to keep this module
+    cheap to import.
+    """
+    import yaml
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Models config at {path} must be a YAML mapping "
+            f"(name -> {{provider: ..., ...}}); got {type(data).__name__}."
+        )
+    for name, entry in data.items():
+        if not isinstance(entry, dict) or "provider" not in entry:
+            raise ValueError(
+                f"Models config at {path}: entry '{name}' must be a "
+                f"dict with at least a 'provider' field."
+            )
+    return data
+
+
+def register_models(entries: dict[str, dict], source: str) -> list[str]:
+    """Merge ``entries`` into MODELS and tag each with ``source``.
+
+    Returns the list of names that were registered (or overridden).
+    """
+    registered = []
+    for name, entry in entries.items():
+        MODELS[name] = entry
+        _MODEL_SOURCES[name] = source
+        registered.append(name)
+    return registered
+
+
+def model_source(name: str) -> str:
+    """Return the source label for a registered model
+    ('built-in', a path, or 'unknown')."""
+    return _MODEL_SOURCES.get(name, "unknown")
+
+
+def _autoload_user_models() -> None:
+    """Import-time hook — load the user-config file if present.
+
+    Silently no-ops if the file doesn't exist or
+    ``PETEY_DISABLE_USER_MODELS`` is set. Bad YAML raises so users
+    notice broken config rather than silently losing entries.
+    """
+    if os.environ.get("PETEY_DISABLE_USER_MODELS"):
+        return
+    path = user_models_path()
+    if not path.exists():
+        return
+    entries = load_models_file(path)
+    register_models(entries, source=str(path))
+
+
+_autoload_user_models()

@@ -37,13 +37,51 @@ See `petey list parsers` for all available parsers.
 
 ## LLM Backends
 
-Petey auto-detects the right backend from the model name.
+Petey ships direct, hand-coded backends per provider family and uses `litellm` only as a fallback for the long tail. The right backend is auto-detected from the model name; override with `--llm-backend` when the default isn't right (e.g. running `gpt-4o` through Azure rather than direct OpenAI).
 
 | Backend | Models | Auto-detected when |
 |---------|--------|--------------------|
-| `openai` | `gpt-4.1-mini`, `gpt-4o`, etc. | Default |
+| `openai` | `gpt-4.1-mini`, `gpt-4o`, etc. | Default; model starts with `gpt-`, `o1`, `o3`, `o4` |
 | `anthropic` | `claude-sonnet-4-6`, `claude-haiku-4-5`, etc. | Model starts with `claude` |
-| `litellm` | Gemini, DeepSeek, Fireworks, Ollama, Bedrock, 100+ more | Model has a provider prefix (e.g. `gemini/`, `deepseek/`, `fireworks_ai/`) |
+| `azure_openai` | Any OpenAI deployment on Azure | Pass `--llm-backend azure_openai` |
+| `ollama` | Local models via Ollama's OpenAI-compat endpoint | Model starts with `ollama/` |
+| `gemini` | `gemini-2.5-flash`, etc. (direct, via `google-genai`) | Model starts with `gemini/` |
+| `anthropic_bedrock` | Claude on AWS Bedrock | Pass `--llm-backend anthropic_bedrock` |
+| `anthropic_vertex` | Claude on GCP Vertex | Pass `--llm-backend anthropic_vertex` |
+| `vertex_ai` | Gemini/Gemma/Llama on GCP Vertex | Pass `--llm-backend vertex_ai` |
+| OpenAI-compat catchalls | DeepSeek, Mistral, Together, OpenRouter, Fireworks, Groq | Model has the provider prefix (e.g. `deepseek/`, `mistral/`) |
+| `litellm` | Bedrock, Cohere, Replicate, HuggingFace, … | Long-tail prefixes only |
+
+Run `petey list llm` to see every backend wired up in your install.
+
+### Custom model registry
+
+The built-in registry covers common cases. To add your own — e.g. an Azure OpenAI tenant with its own endpoint, or a remote Ollama host — edit `~/.petey/models.yaml`:
+
+```bash
+petey models init      # writes a commented template
+petey models path      # prints the resolved file path
+petey models list      # shows all registered models with provenance
+```
+
+```yaml
+# ~/.petey/models.yaml
+my-azure-gpt-4o:
+  provider: azure_openai
+  model: gpt-4o                                            # Azure deployment name
+  config:
+    api_version: "2024-06-01"
+    azure_endpoint: https://my-tenant.openai.azure.com
+    api_key_env: MY_AZURE_KEY                              # env var holding the key
+
+remote-qwen:
+  provider: ollama
+  model: qwen2.5:7b
+  config:
+    base_url: http://gpu-box.local:11434/v1
+```
+
+Then `petey extract -m my-azure-gpt-4o ...` works from any directory. User-config entries override built-ins on key collision. Use `$PETEY_MODELS=path/to/file.yaml` to point at a different file, or `--models-config PATH` for a one-off run.
 
 ## Setup
 
@@ -58,8 +96,16 @@ Or for other providers:
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 GEMINI_API_KEY=...
+DEEPSEEK_API_KEY=...
+MISTRAL_API_KEY=...
+TOGETHER_API_KEY=...
+OPENROUTER_API_KEY=...
+FIREWORKS_API_KEY=...
+GROQ_API_KEY=...
 DATALAB_API_KEY=...
 ```
+
+Azure OpenAI, Bedrock, and Vertex use platform-specific auth (`OPENAI_API_BASE` + `API_VERSION`, AWS boto3 chain, GCP service account). For those, register the deployment in `~/.petey/models.yaml` (see [Custom model registry](#custom-model-registry)) so endpoint and version travel with the model name.
 
 ## Schemas
 
@@ -114,16 +160,21 @@ petey extract --schema invoice.yaml ./invoices/ -o results.csv
 # With options
 petey extract --schema schema.yaml --model claude-sonnet-4-6 --parser datalab ./pdfs/
 
-# List available backends
+# Route a model through a non-default backend (here: gpt-4o on Azure)
+petey extract --schema schema.yaml -m gpt-4o --llm-backend azure_openai ./pdfs/
+
+# Inspect what's available
 petey list parsers
-petey list ocr
 petey list llm
+petey models list
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--schema / -s` | required | Path to YAML schema |
 | `--model / -m` | `gpt-4.1-mini` | LLM model ID |
+| `--llm-backend` | from registry | Override the LLM backend (e.g. `azure_openai`); reads its config from env vars |
+| `--models-config` | none | Per-run YAML of model registry entries (in addition to `~/.petey/models.yaml`) |
 | `--parser` | `pymupdf` | Text extraction backend |
 | `--concurrency / -c` | `10` | Max concurrent API calls |
 | `--output / -o` | stdout | Output file path |
@@ -147,13 +198,24 @@ result = extract(
     schema,
     model="claude-sonnet-4-6",
     parser="datalab",
+    llm_backend="azure_openai",   # optional override
 )
 ```
+
+Custom models registered in `~/.petey/models.yaml` are picked up automatically — no code changes needed; just reference the entry by name in `model=`.
 
 ## Optional Dependencies
 
 ```bash
-pip install petey                    # Core (pymupdf, pdfplumber, litellm)
+pip install petey                    # Core (pymupdf, pdfplumber, openai, anthropic, litellm)
 pip install petey[unstructured]      # + Unstructured API client
 pip install petey[all]               # Everything
 ```
+
+Direct backends with extra SDK requirements:
+
+| Backend | Install |
+|---------|---------|
+| `gemini`, `vertex_ai` | `pip install google-genai` |
+| `anthropic_bedrock`, `anthropic_vertex` | already covered by the core `anthropic` dep |
+| `ollama` | none — uses Ollama's OpenAI-compatible endpoint |

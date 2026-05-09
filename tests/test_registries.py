@@ -1,6 +1,7 @@
 """Tests for parser/LLM registries, plugins, backend options, and provider detection."""
 import asyncio
 import os
+import textwrap
 from pathlib import Path
 from unittest.mock import (
     MagicMock, patch,
@@ -474,3 +475,126 @@ class TestMakeMessages:
         from petey.extract import _make_messages
         msgs = _make_messages("doc text")
         assert "Additional instructions" not in msgs[0]["content"]
+
+
+class TestUserModelsConfig:
+    """User-config YAML loader merges into MODELS at import time
+    and via per-run overrides."""
+
+    def _write_yaml(self, tmp_path, body: str) -> Path:
+        p = tmp_path / "models.yaml"
+        p.write_text(textwrap.dedent(body))
+        return p
+
+    def test_load_models_file_parses_entry(self, tmp_path):
+        from petey.registries.models import load_models_file
+        p = self._write_yaml(tmp_path, """\
+            tenant-a-gpt-4o:
+              provider: azure_openai
+              model: gpt-4o
+              config:
+                api_version: "2024-06-01"
+                azure_endpoint: https://a.azure.test
+                api_key_env: TENANT_A_KEY
+        """)
+        data = load_models_file(p)
+        assert "tenant-a-gpt-4o" in data
+        entry = data["tenant-a-gpt-4o"]
+        assert entry["provider"] == "azure_openai"
+        assert entry["config"]["api_version"] == "2024-06-01"
+
+    def test_load_models_file_rejects_non_mapping(self, tmp_path):
+        from petey.registries.models import load_models_file
+        p = self._write_yaml(tmp_path, "- just\n- a\n- list\n")
+        with pytest.raises(ValueError, match="must be a YAML mapping"):
+            load_models_file(p)
+
+    def test_load_models_file_rejects_missing_provider(self, tmp_path):
+        from petey.registries.models import load_models_file
+        p = self._write_yaml(tmp_path, """\
+            broken:
+              model: foo
+        """)
+        with pytest.raises(ValueError, match="must be a dict with"):
+            load_models_file(p)
+
+    def test_register_models_overrides_builtin(self):
+        from petey.registries.models import (
+            MODELS, register_models, model_source,
+        )
+        original = dict(MODELS["gpt-4o"])
+        try:
+            register_models(
+                {"gpt-4o": {"provider": "anthropic"}},
+                source="test-override",
+            )
+            assert MODELS["gpt-4o"]["provider"] == "anthropic"
+            assert model_source("gpt-4o") == "test-override"
+        finally:
+            MODELS["gpt-4o"] = original
+            # Restore the source by re-registering as built-in
+            register_models({"gpt-4o": original}, source="built-in")
+
+    def test_register_models_tracks_source(self):
+        from petey.registries.models import (
+            MODELS, register_models, model_source,
+        )
+        try:
+            register_models(
+                {"_test_user_model": {"provider": "openai"}},
+                source="/some/path/models.yaml",
+            )
+            assert "_test_user_model" in MODELS
+            assert (
+                model_source("_test_user_model")
+                == "/some/path/models.yaml"
+            )
+        finally:
+            del MODELS["_test_user_model"]
+
+    def test_user_models_path_respects_env_var(self, monkeypatch):
+        from petey.registries.models import user_models_path
+        monkeypatch.setenv("PETEY_MODELS", "/custom/path/m.yaml")
+        assert str(user_models_path()) == "/custom/path/m.yaml"
+
+    def test_user_models_path_default(self, monkeypatch):
+        from petey.registries.models import (
+            user_models_path, DEFAULT_USER_MODELS_PATH,
+        )
+        monkeypatch.delenv("PETEY_MODELS", raising=False)
+        assert user_models_path() == DEFAULT_USER_MODELS_PATH
+
+    def test_user_models_routed_via_make_client(self, tmp_path):
+        """End-to-end: a user-config Azure entry should reach the
+        Azure builder when _make_client is called by name."""
+        from petey.registries.models import (
+            MODELS, load_models_file, register_models,
+        )
+        from petey.extract import _make_client
+        p = self._write_yaml(tmp_path, """\
+            my-azure-deployment:
+              provider: azure_openai
+              model: gpt-4o
+              config:
+                api_version: "2024-06-01"
+                azure_endpoint: https://my-tenant.azure.test
+                api_key_env: MY_AZURE_KEY
+        """)
+        register_models(load_models_file(p), source=str(p))
+        try:
+            with patch.dict(os.environ, {"MY_AZURE_KEY": "k"}):
+                with patch(
+                    "petey.extract.AsyncAzureOpenAI",
+                ) as mock_az:
+                    with patch(
+                        "petey.extract.instructor",
+                    ) as mock_inst:
+                        mock_inst.from_openai.return_value = "cli"
+                        _make_client("my-azure-deployment")
+            mock_az.assert_called_once()
+            kw = mock_az.call_args.kwargs
+            assert kw["api_key"] == "k"
+            assert kw["api_version"] == "2024-06-01"
+            assert kw["azure_endpoint"] == "https://my-tenant.azure.test"
+        finally:
+            del MODELS["my-azure-deployment"]
