@@ -84,6 +84,7 @@ class TestExtractPagesHeaderFallback:
             page = doc.new_page()
             page.insert_text((72, 72), f"Page {i+1} content")
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp.close()
         doc.save(tmp.name)
         doc.close()
 
@@ -137,6 +138,7 @@ class TestExtractPagesHeaderFallback:
             page = doc.new_page()
             page.insert_text((72, 72), f"Page {i+1} content")
         tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp.close()
         doc.save(tmp.name)
         doc.close()
 
