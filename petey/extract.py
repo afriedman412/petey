@@ -1507,9 +1507,9 @@ def _subset_pdf(pdf_path: str, page_indices: list[int]) -> str:
     tmp = tempfile.NamedTemporaryFile(
         suffix=".pdf", delete=False,
     )
+    tmp.close()
     subset.save(tmp.name)
     subset.close()
-    tmp.close()
     return tmp.name
 
 
