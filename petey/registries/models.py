@@ -129,20 +129,55 @@ def load_models_file(path) -> dict[str, dict]:
                 f"Models config at {path}: entry '{name}' must be a "
                 f"dict with at least a 'provider' field."
             )
+        if "default" in entry and not isinstance(entry["default"], bool):
+            raise ValueError(
+                f"Models config at {path}: entry '{name}' has "
+                f"'default: {entry['default']!r}' — must be true or false."
+            )
     return data
+
+
+_DEFAULT_MODEL: str | None = None
 
 
 def register_models(entries: dict[str, dict], source: str) -> list[str]:
     """Merge ``entries`` into MODELS and tag each with ``source``.
 
+    If any entry sets ``default: true``, mark it as the registry-wide
+    default. When multiple entries in one call claim the default, warn
+    and keep the first one.
+
     Returns the list of names that were registered (or overridden).
     """
+    global _DEFAULT_MODEL
     registered = []
+    local_default: str | None = None
     for name, entry in entries.items():
+        entry = dict(entry)
+        is_default = entry.pop("default", False)
         MODELS[name] = entry
         _MODEL_SOURCES[name] = source
         registered.append(name)
+        if is_default:
+            if local_default is None:
+                local_default = name
+            else:
+                import warnings
+                warnings.warn(
+                    f"Models config at {source}: multiple entries set "
+                    f"'default: true' ({local_default!r} and {name!r}). "
+                    f"Keeping {local_default!r} as the default.",
+                    stacklevel=2,
+                )
+    if local_default is not None:
+        _DEFAULT_MODEL = local_default
     return registered
+
+
+def default_model() -> str | None:
+    """Return the model name flagged ``default: true`` in user config,
+    or ``None`` if no user-config entry has claimed the default."""
+    return _DEFAULT_MODEL
 
 
 def model_source(name: str) -> str:

@@ -552,6 +552,76 @@ class TestUserModelsConfig:
         finally:
             del MODELS["_test_user_model"]
 
+    def test_default_true_sets_default_model(self, tmp_path):
+        import petey.registries.models as reg
+        from petey.registries.models import (
+            MODELS, load_models_file, register_models, default_model,
+        )
+        p = self._write_yaml(tmp_path, """\
+            umgpt-gpt-4o:
+              provider: azure_openai
+              default: true
+              model: gpt-4o
+        """)
+        prev = reg._DEFAULT_MODEL
+        try:
+            register_models(load_models_file(p), source=str(p))
+            assert default_model() == "umgpt-gpt-4o"
+            # `default` key is stripped from the stored entry
+            assert "default" not in MODELS["umgpt-gpt-4o"]
+        finally:
+            reg._DEFAULT_MODEL = prev
+            del MODELS["umgpt-gpt-4o"]
+
+    def test_multiple_defaults_warns_and_keeps_first(self, tmp_path):
+        import warnings
+        import petey.registries.models as reg
+        from petey.registries.models import (
+            MODELS, load_models_file, register_models, default_model,
+        )
+        p = self._write_yaml(tmp_path, """\
+            first-model:
+              provider: openai
+              default: true
+            second-model:
+              provider: openai
+              default: true
+        """)
+        prev = reg._DEFAULT_MODEL
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                register_models(load_models_file(p), source=str(p))
+            assert default_model() == "first-model"
+            assert any(
+                "multiple entries set 'default: true'" in str(w.message)
+                for w in caught
+            )
+        finally:
+            reg._DEFAULT_MODEL = prev
+            del MODELS["first-model"]
+            del MODELS["second-model"]
+
+    def test_default_must_be_bool(self, tmp_path):
+        from petey.registries.models import load_models_file
+        p = self._write_yaml(tmp_path, """\
+            broken:
+              provider: openai
+              default: "yes"
+        """)
+        with pytest.raises(ValueError, match="must be true or false"):
+            load_models_file(p)
+
+    def test_default_model_none_when_no_default(self):
+        from petey.registries.models import default_model
+        import petey.registries.models as reg
+        prev = reg._DEFAULT_MODEL
+        try:
+            reg._DEFAULT_MODEL = None
+            assert default_model() is None
+        finally:
+            reg._DEFAULT_MODEL = prev
+
     def test_user_models_path_respects_env_var(self, monkeypatch):
         from petey.registries.models import user_models_path
         monkeypatch.setenv("PETEY_MODELS", "/custom/path/m.yaml")

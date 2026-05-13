@@ -27,7 +27,7 @@ from petey.extract import (
 )
 from petey.registries.models import (
     MODELS, load_models_file, register_models, model_source,
-    user_models_path, DEFAULT_USER_MODELS_PATH,
+    user_models_path, DEFAULT_USER_MODELS_PATH, default_model,
 )
 
 
@@ -317,8 +317,15 @@ def run_extract(args):
     model = (
         args.model
         or spec.get("model")
-        or os.environ.get("PETEY_MODEL", "gpt-4.1-mini")
+        or os.environ.get("PETEY_MODEL")
+        or default_model()
+        or "gpt-4.1-mini"
     )
+    from petey.extract import _get_provider
+    try:
+        provider = _get_provider(model, args.llm_backend)
+    except Exception:
+        provider = "unknown"
 
     # CLI --mode / --table / --query overrides schema mode
     if args.mode is not None:
@@ -355,7 +362,8 @@ def run_extract(args):
         name = os.path.basename(path)
         if data.get("_error"):
             print(
-                f"  [{completed}/{total}] ERROR {name}: {data['_error']}",
+                f"  [{completed}/{total}] ERROR {name} "
+                f"[model={model}, provider={provider}]: {data['_error']}",
                 file=sys.stderr,
             )
         else:
@@ -402,7 +410,7 @@ def run_extract(args):
             print(
                 f"Petey: splitting {pdf_name} into {n_chunks} chunk(s) "
                 f"({pages_per_chunk} page(s) each, {n_pages} pages total) "
-                f"with {model} ({opts})",
+                f"with {model} (provider={provider}, {opts})",
                 file=sys.stderr,
             )
             chunk_completed = 0
@@ -413,7 +421,9 @@ def run_extract(args):
                 if data.get("_error"):
                     print(
                         f"  [{chunk_completed}/{n_chunks}] ERROR "
-                        f"{_name} {label}: {data['_error']}",
+                        f"{_name} {label} "
+                        f"[model={model}, provider={provider}]: "
+                        f"{data['_error']}",
                         file=sys.stderr,
                     )
                 else:
@@ -459,7 +469,7 @@ def run_extract(args):
         # Standard multi-file mode
         print(
             f"Petey: extracting {total} file{'s' if total > 1 else ''} "
-            f"with {model} ({opts})",
+            f"with {model} (provider={provider}, {opts})",
             file=sys.stderr,
         )
 
@@ -535,11 +545,18 @@ def run_infer_schema(args):
     _apply_models_config(args.models_config)
     model = (
         args.model
-        or os.environ.get("PETEY_MODEL", "gpt-4.1-mini")
+        or os.environ.get("PETEY_MODEL")
+        or default_model()
+        or "gpt-4.1-mini"
     )
+    from petey.extract import _get_provider
+    try:
+        provider = _get_provider(model, args.llm_backend)
+    except Exception:
+        provider = "unknown"
     print(
         f"Petey: analyzing {args.pdf} with {model} "
-        f"(sampling {args.max_pages} page(s))",
+        f"(provider={provider}, sampling {args.max_pages} page(s))",
         file=sys.stderr,
     )
 
