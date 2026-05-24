@@ -7,7 +7,7 @@ name = "petey"
 version = "0.4.1"
 description = "Petey — The Easy PDF Extractor"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.11"
 keywords = ["pdf", "extraction", "llm", "openai", "anthropic", "structured-data"]
 classifiers = [
