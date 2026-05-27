@@ -1179,7 +1179,7 @@ INFER_SCHEMA_SYSTEM = (
 )
 
 
-async def infer_schema_async(
+async def infer_blueprint_async(
     pdf_path: str,
     *,
     model: str = "gpt-4.1-mini",
@@ -1190,10 +1190,10 @@ async def infer_schema_async(
     page_range: str | None = None,
     header_pages: int = 0,
 ) -> dict:
-    """Analyze a PDF and suggest an extraction schema.
+    """Analyze a PDF and suggest a blueprint.
 
     Reads up to ``max_pages`` content pages (plus any header
-    pages), sends the text to the LLM, and returns a schema
+    pages), sends the text to the LLM, and returns a blueprint
     spec dict compatible with ``build_model()``.
 
     When ``page_range`` is set, header pages are taken from
@@ -1212,7 +1212,7 @@ async def infer_schema_async(
             to treat as headers (prepended separately).
 
     Returns:
-        Schema spec dict with name, record_type, fields, etc.
+        Blueprint spec dict with name, record_type, fields, etc.
     """
     import json as _json
     import fitz as _fitz
@@ -1320,7 +1320,7 @@ async def infer_schema_async(
         )
 
 
-async def infer_schema_vision_async(
+async def infer_blueprint_vision_async(
     pdf_path: str,
     *,
     model: str = "gpt-4.1-mini",
@@ -1330,7 +1330,7 @@ async def infer_schema_vision_async(
     page_range: str | None = None,
     header_pages: int = 0,
 ) -> dict:
-    """Analyze a PDF and suggest a schema using vision (images).
+    """Analyze a PDF and suggest a blueprint using vision (images).
 
     Renders PDF pages as images and sends them directly to the
     LLM, bypassing text parsing entirely.
@@ -1346,7 +1346,7 @@ async def infer_schema_vision_async(
             to treat as headers.
 
     Returns:
-        Schema spec dict with name, record_type, fields, etc.
+        Blueprint spec dict with name, record_type, fields, etc.
     """
     import json as _json
     import base64 as _b64
@@ -1460,14 +1460,51 @@ async def infer_schema_vision_async(
         )
 
 
-def infer_schema(
+def infer_blueprint(
     pdf_path: str,
     **kwargs,
 ) -> dict:
-    """Sync wrapper around ``infer_schema_async``."""
+    """Sync wrapper around ``infer_blueprint_async``."""
     return asyncio.run(
-        infer_schema_async(pdf_path, **kwargs)
+        infer_blueprint_async(pdf_path, **kwargs)
     )
+
+
+# --- Deprecated aliases (removed in v0.6.0) ---
+
+
+async def infer_schema_async(*args, **kwargs):
+    """(Deprecated) Use :func:`infer_blueprint_async`. Removed in v0.6.0."""
+    warnings.warn(
+        "infer_schema_async() is deprecated; use "
+        "infer_blueprint_async(). Support will be removed in v0.6.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return await infer_blueprint_async(*args, **kwargs)
+
+
+async def infer_schema_vision_async(*args, **kwargs):
+    """(Deprecated) Use :func:`infer_blueprint_vision_async`. Removed in v0.6.0."""
+    warnings.warn(
+        "infer_schema_vision_async() is deprecated; use "
+        "infer_blueprint_vision_async(). "
+        "Support will be removed in v0.6.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return await infer_blueprint_vision_async(*args, **kwargs)
+
+
+def infer_schema(*args, **kwargs):
+    """(Deprecated) Use :func:`infer_blueprint`. Removed in v0.6.0."""
+    warnings.warn(
+        "infer_schema() is deprecated; use infer_blueprint(). "
+        "Support will be removed in v0.6.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return infer_blueprint(*args, **kwargs)
 
 
 # --- Page-chunked extraction ---
