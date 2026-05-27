@@ -1,6 +1,6 @@
 # Petey
 
-Petey is a framework for PDF data extraction. It wires the PDF parser of your choice to the LLM of your choice, and with a simple schema from the user, pulls data out of PDF documents.
+Petey is a framework for PDF data extraction. It wires the PDF parser of your choice to the LLM of your choice, and with a simple blueprint from the user, pulls data out of PDF documents.
 
 ```bash
 pip install petey
@@ -16,12 +16,12 @@ And so the inside of a PDF is often chaotic. It is just a bunch of items — wor
 
 A lot of hard-working folks have developed tools to extract text from PDFs over the years. AI can be a big help too — you don't need a particularly advanced LLM to interpret some fairly difficult documents. But models need infrastructure, and not everyone has time to wire it all together.
 
-Petey does the wiring for you. Just pass it your files and a schema that explains what you want, and it returns a JSON or CSV with your data.
+Petey does the wiring for you. Just pass it your files and a blueprint that explains what you want, and it returns a JSON or CSV with your data.
 
 ## How it works
 
 1. **Parse** — extract text from the PDF using a local or cloud parser
-2. **LLM** — send the text to an LLM with your schema to get the fields you want back
+2. **LLM** — send the text to an LLM with your blueprint to get the fields you want back
 3. **Output** — return the results as JSON or CSV
 
 ## Parsers
@@ -107,9 +107,9 @@ DATALAB_API_KEY=...
 
 Azure OpenAI, Bedrock, and Vertex use platform-specific auth (`OPENAI_API_BASE` + `API_VERSION`, AWS boto3 chain, GCP service account). For those, register the deployment in `~/.petey/models.yaml` (see [Custom model registry](#custom-model-registry)) so endpoint and version travel with the model name.
 
-## Schemas
+## Blueprints
 
-Every extraction starts with a schema — a YAML file that tells Petey what to look for.
+Every extraction starts with a blueprint — a `.bpt` file (YAML format) that tells Petey what to look for.
 
 ```yaml
 name: Invoice
@@ -138,7 +138,7 @@ fields:
 
 All fields are nullable — Petey returns `null` for anything it can't find rather than guessing.
 
-### Schema options
+### Blueprint options
 
 | Option | Description |
 |--------|-------------|
@@ -155,13 +155,13 @@ All fields are nullable — Petey returns `null` for anything it can't find rath
 
 ```bash
 # Basic extraction
-petey extract --schema invoice.yaml ./invoices/ -o results.csv
+petey extract --blueprint invoice.bpt ./invoices/ -o results.csv
 
 # With options
-petey extract --schema schema.yaml --model claude-sonnet-4-6 --parser datalab ./pdfs/
+petey extract --blueprint blueprint.bpt --model claude-sonnet-4-6 --parser datalab ./pdfs/
 
 # Route a model through a non-default backend (here: gpt-4o on Azure)
-petey extract --schema schema.yaml -m gpt-4o --llm-backend azure_openai ./pdfs/
+petey extract --blueprint blueprint.bpt -m gpt-4o --llm-backend azure_openai ./pdfs/
 
 # Inspect what's available
 petey list parsers
@@ -171,7 +171,7 @@ petey models list
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--schema / -s` | required | Path to YAML schema |
+| `--blueprint / -b` | required | Path to blueprint file (`.bpt` or `.yaml`) |
 | `--model / -m` | `gpt-4.1-mini` | LLM model ID |
 | `--llm-backend` | from registry | Override the LLM backend (e.g. `azure_openai`); reads its config from env vars |
 | `--models-config` | none | Per-run YAML of model registry entries (in addition to `~/.petey/models.yaml`) |
@@ -179,23 +179,23 @@ petey models list
 | `--concurrency / -c` | `10` | Max concurrent API calls |
 | `--output / -o` | stdout | Output file path |
 | `--format / -f` | inferred | `csv`, `json`, or `jsonl` |
-| `--mode` | from schema | `query` or `table` |
-| `--header-pages` | from schema | Header pages to prepend to each chunk |
-| `--page-range` | from schema | Page range to extract |
+| `--mode` | from blueprint | `query` or `table` |
+| `--header-pages` | from blueprint | Header pages to prepend to each chunk |
+| `--page-range` | from blueprint | Page range to extract |
 
 ## Python API
 
 ```python
-from petey import extract, load_schema
+from petey import extract, load_blueprint
 
-schema, spec = load_schema("invoice.yaml")
+response_model, spec = load_blueprint("invoice.bpt")
 
-result = extract("invoice.pdf", schema)
+result = extract("invoice.pdf", response_model)
 
 # With options
 result = extract(
     "invoice.pdf",
-    schema,
+    response_model,
     model="claude-sonnet-4-6",
     parser="datalab",
     llm_backend="azure_openai",   # optional override
@@ -203,6 +203,24 @@ result = extract(
 ```
 
 Custom models registered in `~/.petey/models.yaml` are picked up automatically — no code changes needed; just reference the entry by name in `model=`.
+
+## Migrating from v0.4.x → v0.5.0
+
+User-facing concepts have been renamed from "schema" to "blueprint" and the file extension from `.yaml` to `.bpt`. The YAML format itself is unchanged.
+
+| v0.4.x | v0.5.0 |
+|---|---|
+| `load_schema(...)` | `load_blueprint(...)` |
+| `infer_schema(...)` / `infer_schema_async(...)` / `infer_schema_vision_async(...)` | `infer_blueprint(...)` / `infer_blueprint_async(...)` / `infer_blueprint_vision_async(...)` |
+| `petey extract --schema my.yaml ...` | `petey extract --blueprint my.bpt ...` |
+| `petey infer-schema ...` | `petey infer-blueprint ...` |
+| `.yaml` blueprint files | `.bpt` (still parsed as YAML) |
+
+Old names still work in v0.5.0 with a `DeprecationWarning` and will be removed in v0.6.0. To migrate existing `.yaml` blueprint files, just rename them — the file format is unchanged:
+
+```bash
+find . -name "*.yaml" -exec sh -c 'mv "$1" "${1%.yaml}.bpt"' _ {} \;
+```
 
 ## Optional Dependencies
 

@@ -2,9 +2,9 @@
 CLI entrypoint for Petey.
 
 Usage:
-    petey extract --schema schema.yaml ./pdfs/*.pdf
-    petey extract --schema schema.yaml ./pdfs/ -o results.csv
-    petey extract --schema schema.yaml ./pdfs/ --format jsonl -o results.jsonl
+    petey extract --blueprint blueprint.bpt ./pdfs/*.pdf
+    petey extract --blueprint blueprint.bpt ./pdfs/ -o results.csv
+    petey extract --blueprint blueprint.bpt ./pdfs/ --format jsonl -o results.jsonl
 """
 import argparse
 import asyncio
@@ -12,15 +12,16 @@ import csv
 import json
 import os
 import sys
+import warnings
 from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
 import yaml
 
-from petey.schema import load_schema, normalize_dates
+from petey.schema import load_blueprint, normalize_dates
 from petey.extract import (
-    extract_batch, extract_pages_async, infer_schema,
+    extract_batch, extract_pages_async, infer_blueprint,
     PARSERS, LLM_BACKENDS,
     API_PARSERS, PLUGIN_PARSERS,
     PLUGIN_LLM_BACKENDS,
@@ -125,9 +126,17 @@ def main():
     ext = sub.add_parser("extract", help="Extract data from PDFs")
     ext.add_argument(
         "paths", nargs="*",
-        help="PDF files or directories (overrides input in schema)",
+        help="PDF files or directories (overrides input in blueprint)",
     )
-    ext.add_argument("--schema", "-s", required=True, help="YAML schema file")
+    _bp_group = ext.add_mutually_exclusive_group(required=True)
+    _bp_group.add_argument(
+        "--blueprint", "-b",
+        help="Blueprint file (.bpt or .yaml)",
+    )
+    _bp_group.add_argument(
+        "--schema", "-s",
+        help=argparse.SUPPRESS,  # deprecated; use --blueprint
+    )
     ext.add_argument(
         "--model", "-m", default=None,
         help="Model ID (default: gpt-4.1-mini)",
@@ -199,10 +208,11 @@ def main():
         help="Page range to extract (e.g. 2-5 or 1,3,5-7)",
     )
 
-    # --- infer-schema subcommand ---
+    # --- infer-blueprint subcommand (alias: infer-schema, deprecated) ---
     inf = sub.add_parser(
-        "infer-schema",
-        help="Suggest a schema from a sample PDF",
+        "infer-blueprint",
+        aliases=["infer-schema"],
+        help="Suggest a blueprint from a sample PDF",
     )
     inf.add_argument("pdf", help="PDF file to analyze")
     inf.add_argument(
@@ -229,7 +239,7 @@ def main():
     )
     inf.add_argument(
         "--output", "-o", default=None,
-        help="Save schema to YAML file",
+        help="Save blueprint to file (.bpt recommended)",
     )
 
     # --- list subcommand ---
@@ -274,8 +284,16 @@ def main():
 
     if args.command == "extract":
         run_extract(args)
-    elif args.command == "infer-schema":
-        run_infer_schema(args)
+    elif args.command in ("infer-blueprint", "infer-schema"):
+        if args.command == "infer-schema":
+            warnings.warn(
+                "The 'infer-schema' subcommand is deprecated; "
+                "use 'infer-blueprint'. "
+                "Support will be removed in v0.6.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        run_infer_blueprint(args)
     elif args.command == "list":
         run_list(args)
     elif args.command == "models":
@@ -295,16 +313,24 @@ def _apply_models_config(path: str | None) -> None:
 
 def run_extract(args):
     _apply_models_config(args.models_config)
-    response_model, spec = load_schema(args.schema)
+    if args.schema:
+        warnings.warn(
+            "The --schema flag is deprecated; use --blueprint. "
+            "Support will be removed in v0.6.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    blueprint_path = args.blueprint or args.schema
+    response_model, spec = load_blueprint(blueprint_path)
 
-    # Input: CLI paths override schema input
+    # Input: CLI paths override blueprint input
     paths = args.paths or []
     if not paths and spec.get("input"):
         paths = [spec["input"]]
     if not paths:
         print(
             "No input specified. Provide paths on the command line "
-            "or set 'input:' in the schema.",
+            "or set 'input:' in the blueprint.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -541,7 +567,7 @@ def run_extract(args):
     )
 
 
-def run_infer_schema(args):
+def run_infer_blueprint(args):
     _apply_models_config(args.models_config)
     model = (
         args.model
@@ -560,7 +586,7 @@ def run_infer_schema(args):
         file=sys.stderr,
     )
 
-    spec = infer_schema(
+    spec = infer_blueprint(
         args.pdf,
         model=model,
         llm_backend=args.llm_backend,
@@ -575,7 +601,7 @@ def run_infer_schema(args):
     if args.output:
         Path(args.output).write_text(output)
         print(
-            f"Schema saved to {args.output}",
+            f"Blueprint saved to {args.output}",
             file=sys.stderr,
         )
     else:
