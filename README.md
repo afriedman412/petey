@@ -204,11 +204,11 @@ result = extract(
 
 Custom models registered in `~/.petey/models.yaml` are picked up automatically — no code changes needed; just reference the entry by name in `model=`.
 
-## Migrating from v0.4.x → v0.5.0
+## Migrating to v0.5.1
 
 User-facing concepts have been renamed from "schema" to "blueprint" and the file extension from `.yaml` to `.bpt`. The YAML format itself is unchanged.
 
-| v0.4.x | v0.5.0 |
+| Old | New |
 |---|---|
 | `load_schema(...)` | `load_blueprint(...)` |
 | `infer_schema(...)` / `infer_schema_async(...)` / `infer_schema_vision_async(...)` | `infer_blueprint(...)` / `infer_blueprint_async(...)` / `infer_blueprint_vision_async(...)` |
@@ -216,7 +216,7 @@ User-facing concepts have been renamed from "schema" to "blueprint" and the file
 | `petey infer-schema ...` | `petey infer-blueprint ...` |
 | `.yaml` blueprint files | `.bpt` (still parsed as YAML) |
 
-Old names still work in v0.5.0 with a `DeprecationWarning` and will be removed in v0.6.0. To migrate existing `.yaml` blueprint files, just rename them — the file format is unchanged:
+Old names still work in v0.5.1 with a `DeprecationWarning` and will be removed in v0.6.0. To migrate existing `.yaml` blueprint files, just rename them — the file format is unchanged:
 
 ```bash
 find . -name "*.yaml" -exec sh -c 'mv "$1" "${1%.yaml}.bpt"' _ {} \;
