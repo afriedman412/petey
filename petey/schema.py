@@ -1,13 +1,21 @@
 """
-Schema loading and Pydantic model building.
+Blueprint loading and Pydantic model building.
+
+The module name is retained as ``schema.py`` for backwards compatibility; the
+public concept is "blueprint". Old names (``load_schema``, etc.) are kept as
+deprecated wrappers and will be removed in v0.6.0.
 """
 import enum
 import re
+import warnings
 
 import yaml
 from pathlib import Path
 from typing import Annotated
 from pydantic import BaseModel, BeforeValidator, Field, create_model
+
+
+_DEPRECATION_TAIL = "Support will be removed in v0.6.0."
 
 
 def _safe_name(name: str) -> str:
@@ -90,7 +98,7 @@ def _build_field(name: str, cfg: dict) -> tuple:
 
 
 def build_model(spec: dict) -> type[BaseModel]:
-    """Build a Pydantic model from a schema spec dict."""
+    """Build a Pydantic model from a blueprint spec dict."""
     field_definitions = {}
     for name, cfg in spec["fields"].items():
         safe = _safe_field_name(name)
@@ -115,9 +123,46 @@ def build_model(spec: dict) -> type[BaseModel]:
     return model
 
 
-def load_schema(schema_path: str | Path) -> tuple[type[BaseModel], dict]:
-    """Load a YAML schema file and return (PydanticModel, spec_dict)."""
-    with open(schema_path) as f:
+def load_blueprint(
+    blueprint_path: str | Path,
+) -> tuple[type[BaseModel], dict]:
+    """Load a blueprint file and return (PydanticModel, spec_dict).
+
+    Accepts both ``.bpt`` (canonical) and ``.yaml`` (deprecated) extensions.
+    Loading a ``.yaml`` file emits a ``DeprecationWarning``.
+    """
+    path = Path(blueprint_path)
+    suffix = path.suffix.lower()
+    if suffix in (".yaml", ".yml"):
+        warnings.warn(
+            f"The .yaml/.yml blueprint extension is deprecated; "
+            f"rename to .bpt. {_DEPRECATION_TAIL}",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    with open(path) as f:
+        spec = yaml.safe_load(f)
+    return build_model(spec), spec
+
+
+def load_schema(
+    schema_path: str | Path,
+) -> tuple[type[BaseModel], dict]:
+    """(Deprecated) Use :func:`load_blueprint`. Removed in v0.6.0."""
+    warnings.warn(
+        f"load_schema() is deprecated; use load_blueprint(). "
+        f"{_DEPRECATION_TAIL}",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    # Don't call load_blueprint to avoid stacking warnings; inline the work.
+    path = Path(schema_path)
+    suffix = path.suffix.lower()
+    if suffix in (".yaml", ".yml"):
+        # Suppress the extension warning here — caller already got the
+        # load_schema deprecation, no need to double-warn.
+        pass
+    with open(path) as f:
         spec = yaml.safe_load(f)
     return build_model(spec), spec
 
