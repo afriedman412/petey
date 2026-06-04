@@ -409,6 +409,166 @@ class TestRequiredFlag:
         assert "required" not in spec["fields"]["nickname"]
 
 
+class TestPattern:
+    """BPT Spec v1.0 §5.6 — `pattern` validation and prompt signal."""
+
+    def test_matching_value_passes_through(self):
+        spec = {"fields": {"npi": {
+            "type": "string", "description": "NPI",
+            "pattern": r"^\d{10}$",
+        }}}
+        model = build_model(spec)
+        assert model(npi="1234567890").npi == "1234567890"
+
+    def test_null_passes_unchanged(self):
+        """Per §5.6: null extractions are not subject to pattern validation."""
+        spec = {"fields": {"npi": {
+            "type": "string", "description": "",
+            "pattern": r"^\d{10}$",
+        }}}
+        model = build_model(spec)
+        assert model().npi is None
+        assert model(npi=None).npi is None
+
+    def test_mismatch_coerces_to_none_with_warning(self):
+        """Non-null mismatch → None + UserWarning (extraction failure)."""
+        spec = {"fields": {"npi": {
+            "type": "string", "description": "",
+            "pattern": r"^\d{10}$",
+        }}}
+        model = build_model(spec)
+        with pytest.warns(UserWarning, match="Pattern mismatch"):
+            inst = model(npi="abc")
+        assert inst.npi is None
+
+    def test_unanchored_pattern_is_anchored_implicitly(self):
+        """§5.6 — `\\d{10}` and `^\\d{10}$` are equivalent for validation."""
+        spec = {"fields": {"npi": {
+            "type": "string", "description": "",
+            "pattern": r"\d{10}",  # no anchors
+        }}}
+        model = build_model(spec)
+        # "1234567890abc" would substring-match \d{10} but should be rejected
+        # because consumers apply pattern as anchored full match
+        with pytest.warns(UserWarning):
+            inst = model(npi="1234567890abc")
+        assert inst.npi is None
+        # And the clean form still works
+        assert model(npi="1234567890").npi == "1234567890"
+
+    def test_pattern_in_field_description(self):
+        """§5.6.1 — pattern surfaced in description so the LLM sees it."""
+        spec = {"fields": {"npi": {
+            "type": "string", "description": "Box 33a NPI.",
+            "pattern": r"^\d{10}$",
+        }}}
+        model = build_model(spec)
+        schema = model.model_json_schema()
+        npi_props = schema["properties"]["npi"]
+        # description should mention the pattern
+        assert "Box 33a NPI." in npi_props.get("description", "")
+        assert r"^\d{10}$" in npi_props.get("description", "")
+
+    def test_pattern_in_description_without_user_desc(self):
+        """Pattern is surfaced even when no user-provided description."""
+        spec = {"fields": {"npi": {
+            "type": "string", "pattern": r"^\d{10}$",
+        }}}
+        model = build_model(spec)
+        schema = model.model_json_schema()
+        desc = schema["properties"]["npi"].get("description", "")
+        assert r"^\d{10}$" in desc
+
+    def test_pattern_rejected_on_non_string_type(self):
+        """§5.6 — pattern is only valid when type is string."""
+        for bad_type in ("number", "boolean", "date", "category", "array"):
+            spec = {"fields": {"x": {
+                "type": bad_type, "pattern": r"^\d+$",
+            }}}
+            with pytest.raises(ValueError, match="not 'string'"):
+                build_model(spec)
+
+    def test_pattern_rejected_on_type_aliases_of_non_string(self):
+        """Type aliases are normalized before the pattern check."""
+        # `cat` → category → reject
+        spec = {"fields": {"x": {
+            "type": "cat", "values": ["A", "B"], "pattern": r"^[AB]$",
+        }}}
+        with pytest.raises(ValueError, match="not 'string'"):
+            build_model(spec)
+        # `bool` → boolean → reject
+        spec = {"fields": {"x": {"type": "bool", "pattern": r"^.+$"}}}
+        with pytest.raises(ValueError, match="not 'string'"):
+            build_model(spec)
+
+    def test_invalid_regex_raises_at_build_time(self):
+        spec = {"fields": {"x": {
+            "type": "string", "pattern": "[unclosed",
+        }}}
+        with pytest.raises(ValueError, match="invalid regex"):
+            build_model(spec)
+
+    def test_pattern_on_array_child_field(self):
+        """Pattern validation works inside array row schemas."""
+        spec = {"fields": {"items": {
+            "type": "array",
+            "fields": {
+                "code": {
+                    "type": "string", "description": "",
+                    "pattern": r"^[A-Z]{3}$",
+                },
+            },
+        }}}
+        model = build_model(spec)
+        inst = model(items=[{"code": "ABC"}])
+        assert inst.items[0].code == "ABC"
+        with pytest.warns(UserWarning, match="Pattern mismatch"):
+            inst = model(items=[{"code": "abc"}])
+        assert inst.items[0].code is None
+
+    def test_pattern_with_parent_composition(self):
+        """Pattern survives the parent-reference flattening."""
+        spec = {"fields": {
+            "items": {"type": "array"},
+            "code": {
+                "type": "string", "parent": "items",
+                "pattern": r"^[A-Z]{3}$",
+            },
+        }}
+        model = build_model(spec)
+        with pytest.warns(UserWarning):
+            inst = model(items=[{"code": "lower"}])
+        assert inst.items[0].code is None
+
+    def test_pattern_on_nested_array_non_string_still_rejected(self):
+        """Pattern on a non-string array child raises at build."""
+        spec = {"fields": {"items": {
+            "type": "array",
+            "fields": {
+                "qty": {"type": "number", "pattern": r"^\d+$"},
+            },
+        }}}
+        with pytest.raises(ValueError, match="not 'string'"):
+            build_model(spec)
+
+    def test_pattern_with_required_flag(self):
+        """`pattern` + `required: true` coexist (both metadata + validation)."""
+        spec = {"fields": {"npi": {
+            "type": "string", "required": True,
+            "pattern": r"^\d{10}$",
+        }}}
+        model = build_model(spec)
+        # Required is metadata; null still allowed in model
+        assert model().npi is None
+        # Pattern still rejects mismatches
+        with pytest.warns(UserWarning):
+            assert model(npi="bad").npi is None
+        # Match works
+        assert model(npi="9876543210").npi == "9876543210"
+        # spec dict still carries `required` for downstream
+        assert spec["fields"]["npi"]["required"] is True
+
+
 class TestNormalizeDates:
     """Tests for schema.normalize_dates()."""
 

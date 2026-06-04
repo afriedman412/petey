@@ -37,6 +37,33 @@ def _normalize_type(ftype: str | None) -> str | None:
     return _TYPE_ALIASES.get(ftype, ftype)
 
 
+def _build_pattern_validator(pattern: str, field_name: str):
+    """Build a BeforeValidator that enforces BPT Spec v1.0 §5.6.
+
+    The pattern is applied as an anchored full-string match (§5.6: a pattern
+    of ``\\d{10}`` and ``^\\d{10}$`` are equivalent). A non-null value that
+    does not match is treated as an extraction failure — coerced to ``None``
+    and reported via ``UserWarning``. ``None`` passes through unchanged.
+    """
+    compiled = re.compile(pattern)
+
+    def _validate(v, _c=compiled, _p=pattern, _name=field_name):
+        if v is None or not isinstance(v, str):
+            return v
+        if _c.fullmatch(v):
+            return v
+        warnings.warn(
+            f"Pattern mismatch for field {_name!r}: value {v!r} "
+            f"does not match pattern {_p!r}. Treating as extraction "
+            f"failure (BPT Spec v1.0 §5.6).",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+
+    return _validate
+
+
 def _safe_name(name: str) -> str:
     """Sanitize to match OpenAI's function name pattern: ^[a-zA-Z0-9_-]+$"""
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
@@ -50,8 +77,25 @@ def _safe_field_name(name: str) -> str:
 def _build_field(name: str, cfg: dict) -> tuple:
     ftype = _normalize_type(cfg["type"])
     desc = cfg.get("description", "")
+    pattern = cfg.get("pattern")
     safe = _safe_field_name(name)
     alias = name if safe != name else None
+
+    # BPT Spec v1.0 §5.6: pattern is only valid when type is string.
+    if pattern is not None:
+        if ftype != "string":
+            raise ValueError(
+                f"Blueprint field {name!r} declares `pattern` but its "
+                f"type is {ftype!r}, not 'string' "
+                f"(BPT Spec v1.0 §5.6)."
+            )
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise ValueError(
+                f"Blueprint field {name!r} has an invalid regex "
+                f"`pattern` {pattern!r}: {e}."
+            )
 
     def field(**kw):
         if alias:
@@ -117,6 +161,25 @@ def _build_field(name: str, cfg: dict) -> tuple:
             field(default=None, description=desc),
         )
     else:  # string, date
+        if ftype == "string" and pattern is not None:
+            # §5.6.1 — pattern is a comprehension-time signal for the
+            # LLM. Surfacing it in the field description gets it into
+            # the JSON schema instructor sends to the model.
+            augmented_desc = (
+                f"{desc} Must match the canonical regex pattern: "
+                f"{pattern}"
+                if desc
+                else f"Must match the canonical regex pattern: {pattern}"
+            )
+            return (
+                Annotated[
+                    str | None,
+                    BeforeValidator(
+                        _build_pattern_validator(pattern, name),
+                    ),
+                ],
+                field(default=None, description=augmented_desc),
+            )
         return (
             str | None,
             field(default=None, description=desc),
@@ -189,7 +252,9 @@ def build_model(spec: dict) -> type[BaseModel]:
     before building the model. Field-level ``required`` flags (§5.4) are
     preserved in the spec dict for downstream consumers but do not affect
     the Pydantic model's nullability — every field remains nullable in
-    the output type per §5.4.
+    the output type per §5.4. ``pattern`` (§5.6) is enforced as an anchored
+    full-string match on non-null string values; mismatches are coerced to
+    ``None`` (extraction failure) with a ``UserWarning``.
     """
     field_definitions = {}
     resolved_fields = _resolve_parent_refs(spec["fields"])
