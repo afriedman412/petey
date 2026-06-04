@@ -419,14 +419,18 @@ def run_extract(args):
             )
         else:
             print(f"  [{completed}/{total}] {name}", file=sys.stderr)
-        # Stream JSONL immediately
-        if fmt == "jsonl":
-            line = json.dumps(data)
-            if out_file:
-                out_file.write(line + "\n")
-                out_file.flush()
-            else:
-                print(line)
+        # Stream JSONL immediately, one row per line. Every result now
+        # carries an `items` list (single-record blueprints have one).
+        if fmt == "jsonl" and not data.get("_error"):
+            for item in data.get("items") or []:
+                row = dict(item)
+                row["_source_file"] = data.get("_source_file", name)
+                line = json.dumps(row)
+                if out_file:
+                    out_file.write(line + "\n")
+                    out_file.flush()
+                else:
+                    print(line)
 
     instructions = spec.get("instructions", "")
     parser_options = spec.get("parser_options") or None
@@ -483,13 +487,17 @@ def run_extract(args):
                         file=sys.stderr,
                     )
                 data["_source_file"] = _name
-                if fmt == "jsonl":
-                    line = json.dumps(data)
-                    if out_file:
-                        out_file.write(line + "\n")
-                        out_file.flush()
-                    else:
-                        print(line)
+                if fmt == "jsonl" and not data.get("_error"):
+                    for item in data.get("items") or []:
+                        row = dict(item)
+                        row["_source_file"] = _name
+                        row["_page"] = data.get("_page", label)
+                        line = json.dumps(row)
+                        if out_file:
+                            out_file.write(line + "\n")
+                            out_file.flush()
+                        else:
+                            print(line)
 
             results = asyncio.run(
                 extract_pages_async(
@@ -512,6 +520,7 @@ def run_extract(args):
                         or spec.get("pages")
                         or None
                     ),
+                    spec=spec,
                 )
             )
             all_results.extend(results)
@@ -534,23 +543,24 @@ def run_extract(args):
                 on_result=on_result,
                 parser=parser,
                 parser_options=parser_options,
+                spec=spec,
             )
         )
 
     if out_file:
         out_file.close()
 
-    # Unwrap array results
+    # Every result now has an `items` list (BPT Spec v1.0 §6 — unified
+    # output shape). Single-record blueprints just have one item.
     all_records = []
     for data in results:
-        if is_table and "items" in data:
-            for item in data["items"]:
-                item["_source_file"] = data.get("_source_file", "")
-                if "_page" in data:
-                    item["_page"] = data["_page"]
-                all_records.append(item)
-        elif not data.get("_error"):
-            all_records.append(data)
+        if data.get("_error"):
+            continue
+        for item in data.get("items") or []:
+            item["_source_file"] = data.get("_source_file", "")
+            if "_page" in data:
+                item["_page"] = data["_page"]
+            all_records.append(item)
 
     # Normalize date fields to YYYY-MM-DD
     for rec in all_records:
