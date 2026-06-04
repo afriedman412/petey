@@ -184,20 +184,28 @@ def main():
     )
     mode_group = ext.add_mutually_exclusive_group()
     mode_group.add_argument(
+        "--record-type", choices=["single", "array"], default=None,
+        dest="record_type",
+        help=(
+            "Record type (BPT Spec v1.0): single (one record per "
+            "file) or array (multiple records per page). Overrides "
+            "record_type in the blueprint."
+        ),
+    )
+    mode_group.add_argument(
         "--mode", choices=["query", "table"], default=None,
         help=(
-            "Extraction mode: query (one record per file) "
-            "or table (multiple records per page). "
-            "Overrides mode in the schema."
+            "Deprecated: use --record-type instead. "
+            "(query→single, table→array). Removed in v0.6.0."
         ),
     )
     mode_group.add_argument(
         "--query", action="store_const", const="query", dest="mode",
-        help="Shorthand for --mode query",
+        help="Deprecated shorthand for --record-type single.",
     )
     mode_group.add_argument(
         "--table", action="store_const", const="table", dest="mode",
-        help="Shorthand for --mode table",
+        help="Deprecated shorthand for --record-type array.",
     )
     ext.add_argument(
         "--header-pages", type=int, default=None,
@@ -353,13 +361,30 @@ def run_extract(args):
     except Exception:
         provider = "unknown"
 
-    # CLI --mode / --table / --query overrides schema mode
-    if args.mode is not None:
+    # CLI override: --record-type is canonical (BPT Spec v1.0);
+    # --mode / --query / --table remain accepted for one release.
+    if args.record_type is not None:
+        spec["record_type"] = args.record_type
+    elif args.mode is not None:
+        warnings.warn(
+            "--mode/--query/--table are deprecated; use "
+            "--record-type single|array. Support will be "
+            "removed in v0.6.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        spec["record_type"] = "array" if args.mode == "table" else "single"
         spec["mode"] = args.mode
-    # Backwards compat: record_type: array → mode: table
+    # Keep `mode` and `record_type` mirrored for code paths that
+    # still read either key.
     if spec.get("record_type") == "array" and "mode" not in spec:
         spec["mode"] = "table"
-    is_table = spec.get("mode") == "table"
+    elif spec.get("mode") == "table" and "record_type" not in spec:
+        spec["record_type"] = "array"
+    is_table = (
+        spec.get("record_type") == "array"
+        or spec.get("mode") == "table"
+    )
 
     # Output: CLI -o overrides schema output
     output_path = args.output or spec.get("output")

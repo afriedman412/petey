@@ -236,6 +236,179 @@ class TestEnumCaseInsensitive:
             model(status="invalid")
 
 
+class TestBooleanType:
+    """BPT Spec v1.0 §5.3.5 — boolean type and `bool` alias."""
+
+    def test_boolean_true(self):
+        spec = {"fields": {"is_paid": {"type": "boolean", "description": "Is paid"}}}
+        model = build_model(spec)
+        assert model(is_paid=True).is_paid is True
+
+    def test_boolean_false(self):
+        spec = {"fields": {"is_paid": {"type": "boolean", "description": ""}}}
+        model = build_model(spec)
+        assert model(is_paid=False).is_paid is False
+
+    def test_boolean_nullable(self):
+        spec = {"fields": {"is_paid": {"type": "boolean", "description": ""}}}
+        model = build_model(spec)
+        assert model().is_paid is None
+
+    def test_boolean_coerces_strings(self):
+        spec = {"fields": {"flag": {"type": "boolean", "description": ""}}}
+        model = build_model(spec)
+        assert model(flag="yes").flag is True
+        assert model(flag="no").flag is False
+        assert model(flag="true").flag is True
+        assert model(flag="false").flag is False
+
+    def test_boolean_coerces_ints(self):
+        spec = {"fields": {"flag": {"type": "boolean", "description": ""}}}
+        model = build_model(spec)
+        assert model(flag=1).flag is True
+        assert model(flag=0).flag is False
+
+    def test_bool_is_alias_for_boolean(self):
+        """`bool` and `boolean` encode identically per §5.3.5."""
+        spec = {"fields": {"flag": {"type": "bool", "description": ""}}}
+        model = build_model(spec)
+        assert model(flag=True).flag is True
+        assert model(flag=False).flag is False
+        assert model().flag is None
+
+
+class TestTypeAliases:
+    """BPT Spec v1.0 §5.3 — type-name aliases."""
+
+    def test_cat_is_alias_for_category(self):
+        spec = {"fields": {"status": {
+            "type": "cat", "values": ["Open", "Closed"], "description": "",
+        }}}
+        model = build_model(spec)
+        assert model(status="Open").status.value == "Open"
+
+    def test_enum_is_alias_for_category(self):
+        """Already exercised in TestEnumCaseInsensitive — pin it explicitly."""
+        spec = {"fields": {"status": {
+            "type": "enum", "values": ["A", "B"], "description": "",
+        }}}
+        model = build_model(spec)
+        assert model(status="A").status.value == "A"
+
+
+class TestParentComposition:
+    """BPT Spec v1.0 §5.5 — field composition via `parent`."""
+
+    def test_parent_reference_basic(self):
+        spec = {
+            "fields": {
+                "doc_title": {"type": "string", "description": "Title"},
+                "line_items": {"type": "array", "description": "Rows"},
+                "description": {
+                    "type": "string", "description": "Item desc",
+                    "parent": "line_items",
+                },
+                "amount": {
+                    "type": "number", "description": "Item cost",
+                    "parent": "line_items",
+                },
+            }
+        }
+        model = build_model(spec)
+        inst = model(
+            doc_title="Receipt",
+            line_items=[{"description": "Bread", "amount": 3.5}],
+        )
+        assert inst.doc_title == "Receipt"
+        assert len(inst.line_items) == 1
+        assert inst.line_items[0].description == "Bread"
+        assert inst.line_items[0].amount == 3.5
+
+    def test_parent_form_equivalent_to_inline(self):
+        """Both composition modes produce the same output schema (§5.5)."""
+        inline = {"fields": {
+            "items": {
+                "type": "array",
+                "fields": {
+                    "name": {"type": "string", "description": ""},
+                    "cost": {"type": "number", "description": ""},
+                },
+            },
+        }}
+        parented = {"fields": {
+            "items": {"type": "array"},
+            "name": {"type": "string", "description": "", "parent": "items"},
+            "cost": {"type": "number", "description": "", "parent": "items"},
+        }}
+        inline_schema = build_model(inline).model_json_schema()
+        parented_schema = build_model(parented).model_json_schema()
+        # Same shape: items array of {name, cost}
+        assert inline_schema["properties"]["items"]["anyOf"][0]["type"] == \
+               parented_schema["properties"]["items"]["anyOf"][0]["type"]
+
+    def test_parent_undefined_raises(self):
+        spec = {"fields": {
+            "x": {"type": "string", "parent": "does_not_exist"},
+        }}
+        with pytest.raises(ValueError, match="not defined at the top level"):
+            build_model(spec)
+
+    def test_parent_not_array_raises(self):
+        spec = {"fields": {
+            "p": {"type": "string"},
+            "x": {"type": "string", "parent": "p"},
+        }}
+        with pytest.raises(ValueError, match="not 'array'"):
+            build_model(spec)
+
+    def test_parent_mixed_with_inline_raises(self):
+        spec = {"fields": {
+            "items": {
+                "type": "array",
+                "fields": {"a": {"type": "string"}},
+            },
+            "b": {"type": "string", "parent": "items"},
+        }}
+        with pytest.raises(ValueError, match="exactly one composition mode"):
+            build_model(spec)
+
+    def test_parent_does_not_pollute_top_level(self):
+        """Fields with `parent` should NOT appear at the top of the output."""
+        spec = {"fields": {
+            "items": {"type": "array"},
+            "child_a": {"type": "string", "parent": "items"},
+        }}
+        model = build_model(spec)
+        # Top-level fields should be only `items` — child_a moved into items
+        assert "child_a" not in model.model_fields
+        assert "items" in model.model_fields
+
+
+class TestRequiredFlag:
+    """BPT Spec v1.0 §5.4 — `required` is metadata; output stays nullable."""
+
+    def test_required_field_still_nullable_in_output(self):
+        """Per §5.4, `required: true` does NOT change output nullability."""
+        spec = {"fields": {
+            "name": {"type": "string", "required": True, "description": ""},
+        }}
+        model = build_model(spec)
+        # Must still accept null in output — required is a contract assertion,
+        # not a type constraint
+        assert model().name is None
+        assert model(name="x").name == "x"
+
+    def test_required_preserved_in_spec_dict(self):
+        """Downstream consumers can read the flag from the original spec."""
+        spec = {"fields": {
+            "name": {"type": "string", "required": True, "description": ""},
+            "nickname": {"type": "string", "description": ""},
+        }}
+        build_model(spec)  # should not mutate
+        assert spec["fields"]["name"]["required"] is True
+        assert "required" not in spec["fields"]["nickname"]
+
+
 class TestNormalizeDates:
     """Tests for schema.normalize_dates()."""
 

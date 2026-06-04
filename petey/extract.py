@@ -1157,24 +1157,25 @@ INFER_SCHEMA_SYSTEM = (
     "Return valid JSON with this structure:\n"
     "{\n"
     '  "name": "short_snake_case_name",\n'
-    '  "mode": "query" or "table",\n'
+    '  "record_type": "single" or "array",\n'
     '  "instructions": "brief notes about the document format",\n'
     '  "fields": {\n'
     '    "field_name": {\n'
-    '      "type": "string|number|date|enum",\n'
+    '      "type": "string|number|date|boolean|category",\n'
     '      "description": "what this field contains",\n'
-    '      "values": ["only", "for", "enum", "fields"]\n'
+    '      "values": ["only", "for", "category", "fields"]\n'
     "    }\n"
     "  }\n"
     "}\n\n"
     "Guidelines:\n"
-    "- Use table mode for repeating rows/records\n"
-    "- Use query mode if the document has one set of fields\n"
-    "- Use enum when values come from a fixed set\n"
+    "- Use record_type 'array' for repeating rows/records\n"
+    "- Use record_type 'single' if the document has one set of fields\n"
+    "- Use category when values come from a fixed set\n"
+    "- Use boolean for true/false or yes/no fields (e.g., checkboxes, flags)\n"
     "- Use date for dates, number for numbers, string otherwise\n"
     "- Keep field names short, lowercase, snake_case\n"
     "- Include descriptions that help an LLM find the data\n"
-    "- For checkbox/range columns, use enum with range labels\n"
+    "- For range columns (e.g., dollar ranges), use category with range labels\n"
     "- Be thorough — include all extractable fields"
 )
 

@@ -6,7 +6,7 @@ Petey is a framework for PDF data extraction. It wires the PDF parser of your ch
 pip install petey
 ```
 
-For the web version, demos and tutorials, visit [Petey](https://petey.cc/demos).
+For the web version, demos and tutorials, visit [Petey](https://app.petey.cc/demos).
 
 ## Why Petey?
 
@@ -134,15 +134,17 @@ fields:
 | `string` | Any text value |
 | `number` | Integer or decimal |
 | `date` | Returns ISO 8601 format |
-| `category` | Constrained set of values. List `values:` to enforce them. Case-insensitive matching. |
+| `boolean` | True/false. Accepts the usual written forms (`true`/`false`, `yes`/`no`, `1`/`0`). `bool` is an alias. |
+| `category` | Constrained set of values. List `values:` to enforce them. Case-insensitive matching. `cat` and `enum` are aliases. |
+| `array` | A repeating row structure. Define the row shape with a nested `fields:` block, or use the `parent:` form (see [BPT SPEC v1.md](../BPT%20SPEC%20v1.md) §5.5). |
 
-All fields are nullable — Petey returns `null` for anything it can't find rather than guessing.
+All fields are nullable — Petey returns `null` for anything it can't find rather than guessing. Set `required: true` on a field to mark a null result as an extraction failure (a contract assertion, not a type constraint).
 
 ### Blueprint options
 
 | Option | Description |
 |--------|-------------|
-| `mode: table` | Extract multiple records per page (default: `query` — one record per file) |
+| `record_type: array` | Extract multiple records per page (default: `single` — one record per file). The legacy form `mode: table` / `mode: query` is still accepted but deprecated. |
 | `instructions` | Extra guidance appended to the prompt |
 | `header_pages` | Number of leading pages to prepend to every chunk (for context like column headers) |
 | `pages` | Page range to process, e.g. `"2-5"` or `"1,3,5-7"` |
@@ -179,7 +181,8 @@ petey models list
 | `--concurrency / -c` | `10` | Max concurrent API calls |
 | `--output / -o` | stdout | Output file path |
 | `--format / -f` | inferred | `csv`, `json`, or `jsonl` |
-| `--mode` | from blueprint | `query` or `table` |
+| `--record-type` | from blueprint | `single` or `array`. Overrides the blueprint's `record_type`. |
+| `--mode` | from blueprint | *Deprecated*: `query` or `table`. Use `--record-type` instead. |
 | `--header-pages` | from blueprint | Header pages to prepend to each chunk |
 | `--page-range` | from blueprint | Page range to extract |
 
