@@ -410,7 +410,13 @@ class TestRequiredFlag:
 
 
 class TestPattern:
-    """BPT Spec v1.0 §5.6 — `pattern` validation and prompt signal."""
+    """BPT Spec v1.0 §5.6 — `pattern` shapes output via the LLM prompt.
+
+    Pattern is forwarded to the LLM through the field description so it
+    knows the canonical output form. Petey does NOT validate extracted
+    values against the pattern at this layer — that belongs to BPT
+    runtime validation, which is not implemented yet.
+    """
 
     def test_matching_value_passes_through(self):
         spec = {"fields": {"npi": {
@@ -421,7 +427,6 @@ class TestPattern:
         assert model(npi="1234567890").npi == "1234567890"
 
     def test_null_passes_unchanged(self):
-        """Per §5.6: null extractions are not subject to pattern validation."""
         spec = {"fields": {"npi": {
             "type": "string", "description": "",
             "pattern": r"^\d{10}$",
@@ -430,31 +435,17 @@ class TestPattern:
         assert model().npi is None
         assert model(npi=None).npi is None
 
-    def test_mismatch_coerces_to_none_with_warning(self):
-        """Non-null mismatch → None + UserWarning (extraction failure)."""
+    def test_mismatch_passes_through_unchanged(self):
+        """No input-gating: non-matching values are NOT coerced to None."""
         spec = {"fields": {"npi": {
             "type": "string", "description": "",
             "pattern": r"^\d{10}$",
         }}}
         model = build_model(spec)
-        with pytest.warns(UserWarning, match="Pattern mismatch"):
-            inst = model(npi="abc")
-        assert inst.npi is None
-
-    def test_unanchored_pattern_is_anchored_implicitly(self):
-        """§5.6 — `\\d{10}` and `^\\d{10}$` are equivalent for validation."""
-        spec = {"fields": {"npi": {
-            "type": "string", "description": "",
-            "pattern": r"\d{10}",  # no anchors
-        }}}
-        model = build_model(spec)
-        # "1234567890abc" would substring-match \d{10} but should be rejected
-        # because consumers apply pattern as anchored full match
-        with pytest.warns(UserWarning):
-            inst = model(npi="1234567890abc")
-        assert inst.npi is None
-        # And the clean form still works
-        assert model(npi="1234567890").npi == "1234567890"
+        # The LLM sees the pattern in the description and should produce a
+        # matching canonical form. Any non-matching value that arrives here
+        # is left intact — validation isn't this layer's job.
+        assert model(npi="abc").npi == "abc"
 
     def test_pattern_in_field_description(self):
         """§5.6.1 — pattern surfaced in description so the LLM sees it."""
@@ -479,37 +470,41 @@ class TestPattern:
         desc = schema["properties"]["npi"].get("description", "")
         assert r"^\d{10}$" in desc
 
-    def test_pattern_rejected_on_non_string_type(self):
-        """§5.6 — pattern is only valid when type is string."""
+    def test_build_model_permissive_on_non_string_pattern(self):
+        """build_model alone does NOT enforce pattern type rules.
+
+        Spec-conformance (pattern only on strings) lives in
+        validate_blueprint, called by load_blueprint. build_model is
+        permissive and silently ignores patterns on non-string fields.
+        """
         for bad_type in ("number", "boolean", "date", "category", "array"):
-            spec = {"fields": {"x": {
-                "type": bad_type, "pattern": r"^\d+$",
-            }}}
-            with pytest.raises(ValueError, match="not 'string'"):
-                build_model(spec)
+            cfg = {"type": bad_type, "pattern": r"^\d+$"}
+            if bad_type == "category":
+                cfg["values"] = ["a", "b"]
+            model = build_model({"fields": {"x": cfg}})  # no raise
+            desc = (
+                model.model_json_schema()["properties"]["x"]
+                .get("description", "")
+            )
+            assert "pattern" not in desc.lower(), (
+                f"Pattern leaked into description for type={bad_type!r}"
+            )
 
-    def test_pattern_rejected_on_type_aliases_of_non_string(self):
-        """Type aliases are normalized before the pattern check."""
-        # `cat` → category → reject
-        spec = {"fields": {"x": {
-            "type": "cat", "values": ["A", "B"], "pattern": r"^[AB]$",
-        }}}
-        with pytest.raises(ValueError, match="not 'string'"):
-            build_model(spec)
-        # `bool` → boolean → reject
-        spec = {"fields": {"x": {"type": "bool", "pattern": r"^.+$"}}}
-        with pytest.raises(ValueError, match="not 'string'"):
-            build_model(spec)
-
-    def test_invalid_regex_raises_at_build_time(self):
+    def test_build_model_permissive_on_invalid_regex(self):
+        """build_model does NOT compile-check the regex."""
         spec = {"fields": {"x": {
             "type": "string", "pattern": "[unclosed",
         }}}
-        with pytest.raises(ValueError, match="invalid regex"):
-            build_model(spec)
+        model = build_model(spec)  # no raise
+        desc = (
+            model.model_json_schema()["properties"]["x"]
+            .get("description", "")
+        )
+        # The unchecked pattern is still surfaced in the description
+        assert "[unclosed" in desc
 
-    def test_pattern_on_array_child_field(self):
-        """Pattern validation works inside array row schemas."""
+    def test_pattern_in_array_child_description(self):
+        """Pattern propagates into array row JSON schema, no value gating."""
         spec = {"fields": {"items": {
             "type": "array",
             "fields": {
@@ -520,14 +515,21 @@ class TestPattern:
             },
         }}}
         model = build_model(spec)
-        inst = model(items=[{"code": "ABC"}])
-        assert inst.items[0].code == "ABC"
-        with pytest.warns(UserWarning, match="Pattern mismatch"):
-            inst = model(items=[{"code": "abc"}])
-        assert inst.items[0].code is None
+        # Non-matching value passes through (no gating)
+        assert model(items=[{"code": "abc"}]).items[0].code == "abc"
+        # And the row-level field carries the pattern in its description
+        schema = model.model_json_schema()
+        defs = schema.get("$defs") or schema.get("definitions") or {}
+        item_def = next(
+            (v for v in defs.values() if "code" in v.get("properties", {})),
+            None,
+        )
+        assert item_def is not None
+        code_desc = item_def["properties"]["code"].get("description", "")
+        assert r"^[A-Z]{3}$" in code_desc
 
     def test_pattern_with_parent_composition(self):
-        """Pattern survives the parent-reference flattening."""
+        """Pattern survives the parent-reference flattening; no gating."""
         spec = {"fields": {
             "items": {"type": "array"},
             "code": {
@@ -536,23 +538,10 @@ class TestPattern:
             },
         }}
         model = build_model(spec)
-        with pytest.warns(UserWarning):
-            inst = model(items=[{"code": "lower"}])
-        assert inst.items[0].code is None
-
-    def test_pattern_on_nested_array_non_string_still_rejected(self):
-        """Pattern on a non-string array child raises at build."""
-        spec = {"fields": {"items": {
-            "type": "array",
-            "fields": {
-                "qty": {"type": "number", "pattern": r"^\d+$"},
-            },
-        }}}
-        with pytest.raises(ValueError, match="not 'string'"):
-            build_model(spec)
+        assert model(items=[{"code": "lower"}]).items[0].code == "lower"
 
     def test_pattern_with_required_flag(self):
-        """`pattern` + `required: true` coexist (both metadata + validation)."""
+        """`pattern` + `required: true` coexist as orthogonal metadata."""
         spec = {"fields": {"npi": {
             "type": "string", "required": True,
             "pattern": r"^\d{10}$",
@@ -560,13 +549,93 @@ class TestPattern:
         model = build_model(spec)
         # Required is metadata; null still allowed in model
         assert model().npi is None
-        # Pattern still rejects mismatches
-        with pytest.warns(UserWarning):
-            assert model(npi="bad").npi is None
-        # Match works
+        # Pattern doesn't gate input — non-matching passes through
+        assert model(npi="bad").npi == "bad"
         assert model(npi="9876543210").npi == "9876543210"
         # spec dict still carries `required` for downstream
         assert spec["fields"]["npi"]["required"] is True
+
+
+class TestValidateBlueprint:
+    """BPT Spec v1.0 — load-time blueprint validation.
+
+    validate_blueprint() is called by load_blueprint() and raises on any
+    spec-conformance violation. build_model itself stays permissive — the
+    enforcement boundary is the blueprint-loading step.
+    """
+
+    def test_valid_blueprint_passes(self):
+        from petey.schema import validate_blueprint
+        validate_blueprint({"fields": {"npi": {
+            "type": "string", "pattern": r"^\d{10}$",
+        }}})  # no raise
+
+    def test_pattern_on_non_string_raises(self):
+        from petey.schema import validate_blueprint
+        for bad_type in ("number", "boolean", "date", "category", "array"):
+            spec = {"fields": {"x": {
+                "type": bad_type, "pattern": r"^\d+$",
+            }}}
+            with pytest.raises(ValueError, match="not 'string'"):
+                validate_blueprint(spec)
+
+    def test_pattern_on_type_aliases_normalized(self):
+        from petey.schema import validate_blueprint
+        # `cat` → category → raise
+        with pytest.raises(ValueError, match="not 'string'"):
+            validate_blueprint({"fields": {"x": {
+                "type": "cat", "values": ["A", "B"], "pattern": r"^[AB]$",
+            }}})
+        # `bool` → boolean → raise
+        with pytest.raises(ValueError, match="not 'string'"):
+            validate_blueprint({"fields": {"x": {
+                "type": "bool", "pattern": r"^.+$",
+            }}})
+
+    def test_invalid_regex_raises(self):
+        from petey.schema import validate_blueprint
+        with pytest.raises(ValueError, match="invalid regex"):
+            validate_blueprint({"fields": {"x": {
+                "type": "string", "pattern": "[unclosed",
+            }}})
+
+    def test_pattern_recurses_into_array_children(self):
+        from petey.schema import validate_blueprint
+        spec = {"fields": {"items": {
+            "type": "array",
+            "fields": {
+                "qty": {"type": "number", "pattern": r"^\d+$"},
+            },
+        }}}
+        with pytest.raises(ValueError, match="not 'string'"):
+            validate_blueprint(spec)
+
+    def test_load_blueprint_invokes_validate(self, tmp_path):
+        """A .bpt with a non-string pattern fails at load_blueprint()."""
+        from petey.schema import load_blueprint
+        bpt = tmp_path / "bad.bpt"
+        bpt.write_text(
+            "fields:\n"
+            "  qty:\n"
+            "    type: number\n"
+            "    pattern: '^\\d+$'\n"
+        )
+        with pytest.raises(ValueError, match="not 'string'"):
+            load_blueprint(bpt)
+
+    def test_load_blueprint_passes_valid(self, tmp_path):
+        from petey.schema import load_blueprint
+        bpt = tmp_path / "good.bpt"
+        bpt.write_text(
+            "fields:\n"
+            "  npi:\n"
+            "    type: string\n"
+            "    description: NPI\n"
+            "    pattern: '^\\d{10}$'\n"
+        )
+        model, spec = load_blueprint(bpt)
+        assert "npi" in model.model_fields
+        assert spec["fields"]["npi"]["pattern"] == r"^\d{10}$"
 
 
 class TestNormalizeDates:
