@@ -184,20 +184,28 @@ def main():
     )
     mode_group = ext.add_mutually_exclusive_group()
     mode_group.add_argument(
+        "--record-type", choices=["single", "array"], default=None,
+        dest="record_type",
+        help=(
+            "Record type (BPT Spec v1.0): single (one record per "
+            "file) or array (multiple records per page). Overrides "
+            "record_type in the blueprint."
+        ),
+    )
+    mode_group.add_argument(
         "--mode", choices=["query", "table"], default=None,
         help=(
-            "Extraction mode: query (one record per file) "
-            "or table (multiple records per page). "
-            "Overrides mode in the schema."
+            "Deprecated: use --record-type instead. "
+            "(query→single, table→array). Removed in v0.6.0."
         ),
     )
     mode_group.add_argument(
         "--query", action="store_const", const="query", dest="mode",
-        help="Shorthand for --mode query",
+        help="Deprecated shorthand for --record-type single.",
     )
     mode_group.add_argument(
         "--table", action="store_const", const="table", dest="mode",
-        help="Shorthand for --mode table",
+        help="Deprecated shorthand for --record-type array.",
     )
     ext.add_argument(
         "--header-pages", type=int, default=None,
@@ -353,13 +361,30 @@ def run_extract(args):
     except Exception:
         provider = "unknown"
 
-    # CLI --mode / --table / --query overrides schema mode
-    if args.mode is not None:
+    # CLI override: --record-type is canonical (BPT Spec v1.0);
+    # --mode / --query / --table remain accepted for one release.
+    if args.record_type is not None:
+        spec["record_type"] = args.record_type
+    elif args.mode is not None:
+        warnings.warn(
+            "--mode/--query/--table are deprecated; use "
+            "--record-type single|array. Support will be "
+            "removed in v0.6.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        spec["record_type"] = "array" if args.mode == "table" else "single"
         spec["mode"] = args.mode
-    # Backwards compat: record_type: array → mode: table
+    # Keep `mode` and `record_type` mirrored for code paths that
+    # still read either key.
     if spec.get("record_type") == "array" and "mode" not in spec:
         spec["mode"] = "table"
-    is_table = spec.get("mode") == "table"
+    elif spec.get("mode") == "table" and "record_type" not in spec:
+        spec["record_type"] = "array"
+    is_table = (
+        spec.get("record_type") == "array"
+        or spec.get("mode") == "table"
+    )
 
     # Output: CLI -o overrides schema output
     output_path = args.output or spec.get("output")
@@ -394,14 +419,18 @@ def run_extract(args):
             )
         else:
             print(f"  [{completed}/{total}] {name}", file=sys.stderr)
-        # Stream JSONL immediately
-        if fmt == "jsonl":
-            line = json.dumps(data)
-            if out_file:
-                out_file.write(line + "\n")
-                out_file.flush()
-            else:
-                print(line)
+        # Stream JSONL immediately, one row per line. Every result now
+        # carries an `items` list (single-record blueprints have one).
+        if fmt == "jsonl" and not data.get("_error"):
+            for item in data.get("items") or []:
+                row = dict(item)
+                row["_source_file"] = data.get("_source_file", name)
+                line = json.dumps(row)
+                if out_file:
+                    out_file.write(line + "\n")
+                    out_file.flush()
+                else:
+                    print(line)
 
     instructions = spec.get("instructions", "")
     parser_options = spec.get("parser_options") or None
@@ -458,13 +487,17 @@ def run_extract(args):
                         file=sys.stderr,
                     )
                 data["_source_file"] = _name
-                if fmt == "jsonl":
-                    line = json.dumps(data)
-                    if out_file:
-                        out_file.write(line + "\n")
-                        out_file.flush()
-                    else:
-                        print(line)
+                if fmt == "jsonl" and not data.get("_error"):
+                    for item in data.get("items") or []:
+                        row = dict(item)
+                        row["_source_file"] = _name
+                        row["_page"] = data.get("_page", label)
+                        line = json.dumps(row)
+                        if out_file:
+                            out_file.write(line + "\n")
+                            out_file.flush()
+                        else:
+                            print(line)
 
             results = asyncio.run(
                 extract_pages_async(
@@ -487,6 +520,7 @@ def run_extract(args):
                         or spec.get("pages")
                         or None
                     ),
+                    spec=spec,
                 )
             )
             all_results.extend(results)
@@ -509,23 +543,24 @@ def run_extract(args):
                 on_result=on_result,
                 parser=parser,
                 parser_options=parser_options,
+                spec=spec,
             )
         )
 
     if out_file:
         out_file.close()
 
-    # Unwrap array results
+    # Every result now has an `items` list (BPT Spec v1.0 §6 — unified
+    # output shape). Single-record blueprints just have one item.
     all_records = []
     for data in results:
-        if is_table and "items" in data:
-            for item in data["items"]:
-                item["_source_file"] = data.get("_source_file", "")
-                if "_page" in data:
-                    item["_page"] = data["_page"]
-                all_records.append(item)
-        elif not data.get("_error"):
-            all_records.append(data)
+        if data.get("_error"):
+            continue
+        for item in data.get("items") or []:
+            item["_source_file"] = data.get("_source_file", "")
+            if "_page" in data:
+                item["_page"] = data["_page"]
+            all_records.append(item)
 
     # Normalize date fields to YYYY-MM-DD
     for rec in all_records:
