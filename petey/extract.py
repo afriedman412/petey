@@ -51,12 +51,38 @@ TEXT_WARN_THRESHOLD = 50_000
 SHORT_TEXT_THRESHOLD = 200  # warn before LLM if text is this short
 
 
+def _required_field_names(spec: dict | None) -> set[str]:
+    """Return the set of top-level field names with `required: true`.
+
+    BPT Spec v1.0 §5.4 — `required` is a contract assertion on the
+    output, not a Pydantic-level nullability constraint. We surface
+    it as a warning during quality checks.
+    """
+    if not isinstance(spec, dict):
+        return set()
+    fields = spec.get("fields") or {}
+    return {
+        name for name, cfg in fields.items()
+        if isinstance(cfg, dict) and cfg.get("required")
+    }
+
+
 def _check_extraction_quality(
     data: dict,
     text: str,
     label: str = "",
+    spec: dict | None = None,
 ) -> list[str]:
     """Check extraction results for quality issues.
+
+    Walks the unified `items` shape (BPT Spec v1.0 §6): every extraction
+    returns an object with an `items` list, regardless of `record_type`.
+    `single` is just `items` containing one row.
+
+    Emits:
+    - text-too-short warning
+    - majority-null warning aggregated across all row cells
+    - per-row warning when a `required: true` field comes back null
 
     Returns a list of warning strings (empty if everything looks fine).
     """
@@ -69,19 +95,46 @@ def _check_extraction_quality(
             f"({len(text.strip())} chars) — try a different parser"
         )
 
-    fields = {
-        k: v for k, v in data.items()
-        if not k.startswith("_")
-    }
-    if fields:
-        null_count = sum(
-            1 for v in fields.values() if v is None
-        )
-        if null_count >= len(fields) * 0.8:
-            msgs.append(
-                f"{prefix}{null_count}/{len(fields)} fields "
-                f"are null"
+    if not isinstance(data, dict):
+        return msgs
+    rows = data.get("items")
+    if not isinstance(rows, list) or not rows:
+        return msgs
+
+    # Aggregate field-null counts across all rows.
+    field_keys = [
+        k for k in rows[0].keys() if not k.startswith("_")
+    ]
+    if field_keys:
+        total = 0
+        null_count = 0
+        for row in rows:
+            for k in field_keys:
+                total += 1
+                if row.get(k) is None:
+                    null_count += 1
+        if total and null_count >= total * 0.8:
+            row_suffix = (
+                f" across {len(rows)} records" if len(rows) > 1 else ""
             )
+            msgs.append(
+                f"{prefix}{null_count}/{total} fields "
+                f"are null{row_suffix}"
+            )
+
+    required_names = _required_field_names(spec)
+    if required_names:
+        multi = len(rows) > 1
+        for ri, row in enumerate(rows):
+            for fname in required_names:
+                if row.get(fname) is None:
+                    row_tag = (
+                        f" (row {ri + 1}/{len(rows)})" if multi else ""
+                    )
+                    msgs.append(
+                        f"{prefix}required field {fname!r} is "
+                        f"null{row_tag}"
+                    )
     return msgs
 
 
@@ -1037,6 +1090,7 @@ async def extract_async(
     text: str | None = None,
     parse_fn=None,
     parser_options: dict | None = None,
+    spec: dict | None = None,
 ) -> BaseModel:
     """Extract structured data from a single PDF.
 
@@ -1101,7 +1155,7 @@ async def extract_async(
                 )
                 data = result.model_dump(by_alias=True)
                 for msg in _check_extraction_quality(
-                    data, text, label=label,
+                    data, text, label=label, spec=spec,
                 ):
                     print(msg, flush=True)
                 return result
@@ -1157,24 +1211,25 @@ INFER_SCHEMA_SYSTEM = (
     "Return valid JSON with this structure:\n"
     "{\n"
     '  "name": "short_snake_case_name",\n'
-    '  "mode": "query" or "table",\n'
+    '  "record_type": "single" or "array",\n'
     '  "instructions": "brief notes about the document format",\n'
     '  "fields": {\n'
     '    "field_name": {\n'
-    '      "type": "string|number|date|enum",\n'
+    '      "type": "string|number|date|boolean|category",\n'
     '      "description": "what this field contains",\n'
-    '      "values": ["only", "for", "enum", "fields"]\n'
+    '      "values": ["only", "for", "category", "fields"]\n'
     "    }\n"
     "  }\n"
     "}\n\n"
     "Guidelines:\n"
-    "- Use table mode for repeating rows/records\n"
-    "- Use query mode if the document has one set of fields\n"
-    "- Use enum when values come from a fixed set\n"
+    "- Use record_type 'array' for repeating rows/records\n"
+    "- Use record_type 'single' if the document has one set of fields\n"
+    "- Use category when values come from a fixed set\n"
+    "- Use boolean for true/false or yes/no fields (e.g., checkboxes, flags)\n"
     "- Use date for dates, number for numbers, string otherwise\n"
     "- Keep field names short, lowercase, snake_case\n"
     "- Include descriptions that help an LLM find the data\n"
-    "- For checkbox/range columns, use enum with range labels\n"
+    "- For range columns (e.g., dollar ranges), use category with range labels\n"
     "- Be thorough — include all extractable fields"
 )
 
@@ -1568,6 +1623,7 @@ async def extract_pages_async(
     parse_multiplier: int = 5,
     parse_fn=None,
     parser_options: dict | None = None,
+    spec: dict | None = None,
 ) -> list[dict]:
     """Split a PDF into page chunks and extract each concurrently.
 
@@ -1755,7 +1811,7 @@ async def extract_pages_async(
                     data = result.model_dump(by_alias=True)
                     data["_page"] = label
                     for msg in _check_extraction_quality(
-                        data, text, label=label,
+                        data, text, label=label, spec=spec,
                     ):
                         print(msg, flush=True)
                     break
@@ -1835,6 +1891,7 @@ async def extract_batch(
     llm_backend: str | None = None,
     parse_fn=None,
     parser_options: dict | None = None,
+    spec: dict | None = None,
 ) -> list[dict]:
     """Extract from multiple PDFs concurrently.
 
@@ -1902,7 +1959,7 @@ async def extract_batch(
             fname = os.path.basename(path)
             data["_source_file"] = fname
             for msg in _check_extraction_quality(
-                data, text, label=fname,
+                data, text, label=fname, spec=spec,
             ):
                 print(msg, flush=True)
         except Exception as e:

@@ -208,44 +208,119 @@ class TestCLI:
 # ---------------------------------------------------------------------------
 
 class TestCheckExtractionQuality:
+    """Quality checks for the unified items-wrapped output shape
+    (BPT Spec v1.0 §6). data is always `{items: [row, ...], _meta: ...}`.
+    """
+
     def test_all_nulls_warns(self):
         from petey.extract import _check_extraction_quality
-        data = {"name": None, "age": None, "city": None}
+        data = {"items": [{"name": None, "age": None, "city": None}]}
         msgs = _check_extraction_quality(data, "some text " * 50)
         assert any("3/3 fields" in m for m in msgs)
 
     def test_mostly_nulls_warns(self):
         from petey.extract import _check_extraction_quality
-        data = {
+        data = {"items": [{
             "a": None, "b": None, "c": None, "d": None,
             "e": None, "f": "value",
-        }
+        }]}
         msgs = _check_extraction_quality(data, "some text " * 50)
         assert any("5/6 fields" in m for m in msgs)
 
+    def test_aggregates_nulls_across_multiple_rows(self):
+        from petey.extract import _check_extraction_quality
+        # 5 rows, 2 fields each = 10 cells, 9 null
+        data = {"items": [
+            {"a": None, "b": None},
+            {"a": None, "b": None},
+            {"a": None, "b": None},
+            {"a": None, "b": None},
+            {"a": "x", "b": None},
+        ]}
+        msgs = _check_extraction_quality(data, "some text " * 50)
+        assert any("9/10 fields" in m for m in msgs)
+        assert any("5 records" in m for m in msgs)
+
     def test_short_text_warns(self):
         from petey.extract import _check_extraction_quality
-        data = {"name": "Alice", "age": 30}
+        data = {"items": [{"name": "Alice", "age": 30}]}
         msgs = _check_extraction_quality(data, "short")
         assert any("very short" in m for m in msgs)
 
     def test_good_extraction_no_warnings(self):
         from petey.extract import _check_extraction_quality
-        data = {"name": "Alice", "age": 30, "city": "NYC"}
+        data = {"items": [{"name": "Alice", "age": 30, "city": "NYC"}]}
         msgs = _check_extraction_quality(data, "x" * 500)
         assert msgs == []
 
     def test_ignores_underscore_fields(self):
         from petey.extract import _check_extraction_quality
-        data = {"_page": "p1", "_source_file": "test.pdf", "name": "Alice"}
+        data = {
+            "_page": "p1",
+            "_source_file": "test.pdf",
+            "items": [{"_internal": None, "name": "Alice"}],
+        }
         msgs = _check_extraction_quality(data, "x" * 500)
         assert msgs == []
 
     def test_label_in_message(self):
         from petey.extract import _check_extraction_quality
-        data = {"name": None}
+        data = {"items": [{"name": None}]}
         msgs = _check_extraction_quality(data, "short", label="p1")
         assert any("p1" in m for m in msgs)
+
+    def test_empty_items_no_warning(self):
+        from petey.extract import _check_extraction_quality
+        # No records extracted is a valid state — don't spam warnings
+        data = {"items": []}
+        msgs = _check_extraction_quality(data, "x" * 500)
+        assert msgs == []
+
+    def test_required_null_warns(self):
+        from petey.extract import _check_extraction_quality
+        spec = {"fields": {
+            "ssn": {"type": "string", "required": True},
+            "name": {"type": "string"},
+        }}
+        data = {"items": [{"ssn": None, "name": "Alice"}]}
+        msgs = _check_extraction_quality(data, "x" * 500, spec=spec)
+        assert any("required field 'ssn' is null" in m for m in msgs)
+
+    def test_required_present_no_warning(self):
+        from petey.extract import _check_extraction_quality
+        spec = {"fields": {
+            "ssn": {"type": "string", "required": True},
+        }}
+        data = {"items": [{"ssn": "123-45-6789"}]}
+        msgs = _check_extraction_quality(data, "x" * 500, spec=spec)
+        assert msgs == []
+
+    def test_required_null_across_rows_tags_each(self):
+        from petey.extract import _check_extraction_quality
+        spec = {"fields": {
+            "id": {"type": "string", "required": True},
+        }}
+        data = {"items": [
+            {"id": "x"},
+            {"id": None},
+            {"id": None},
+        ]}
+        msgs = _check_extraction_quality(data, "x" * 500, spec=spec)
+        # Two rows missing the required field, each tagged with its row #
+        required_msgs = [m for m in msgs if "required field 'id'" in m]
+        assert len(required_msgs) == 2
+        assert any("row 2/3" in m for m in required_msgs)
+        assert any("row 3/3" in m for m in required_msgs)
+
+    def test_no_spec_means_no_required_check(self):
+        from petey.extract import _check_extraction_quality
+        # Without a spec, we can't know which fields are required —
+        # only the null-aggregate and short-text warnings run.
+        data = {"items": [{"x": None}]}
+        msgs = _check_extraction_quality(data, "x" * 500)
+        # Only field is null → 100% null → null warning fires
+        assert any("1/1 fields" in m for m in msgs)
+        assert not any("required" in m for m in msgs)
 
 
 # ---------------------------------------------------------------------------
